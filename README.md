@@ -143,6 +143,7 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
 - `response.md` — extracted assistant message (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
 - `result.json` — terminal status (atomic)
+- `conversation.json` — `{url, captured_at}`, the ChatGPT conversation this run submitted to. Diagnostic breadcrumb for manual recovery; written once the URL is known.
 - `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
 - `final.html` — last DOM snapshot
 - `network.json` — captured `/backend-api/*` calls
@@ -151,6 +152,19 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 ## Concurrency
 
 Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
+
+## Closing the Chrome tab mid-run
+
+If you accidentally close a worker's Chrome tab/window while it's generating, the worker reopens the **same** conversation on a fresh tab and resumes monitoring — it never re-pastes or re-sends (a resend would burn another 5–20 min of Pro reasoning). Watch for `conversation_url_captured`, then `page_recovery_attempt` → `page_recovery_succeeded` in `worker.stderr`. Recovery is bounded (3 reopens) and runs entirely inside the **original** 60-min generation budget — it never grants a fresh deadline.
+
+Terminal (not auto-recovered) cases, all fail closed with a specific `reason`:
+- **Closing before the conversation URL is captured** (`page_closed_before_conversation_url` / `send_outcome_unknown`) — the send may be in flight server-side, but with no captured URL the worker refuses to guess a conversation or resubmit.
+- **Quitting/killing Chrome or a full CDP disconnect** (`browser_disconnected_after_send`) — recovery reopens a tab in the *surviving* context only; it does not relaunch Chrome under sibling workers.
+- **A recovery navigation that redirects to login/home/another conversation, drops auth, or never renders the conversation** (`page_recovery_failed` with a `recovery_reason`).
+- **A reopened tab that is then navigated to a different conversation** (e.g. a human grabs the background tab) — `conversation_drift`; the worker refuses to extract/return another conversation's answer.
+- **Repeated closes exhausting the budget** (`page_recovery_exhausted`), or the deadline expiring mid-recovery (`status: timeout`).
+
+Whether ChatGPT resumes *live* streaming on reopen (vs. only showing the finished turn) is server-side behavior; either way the Copy-button completion gate and served-model audit still apply, so the worst case is a clean timeout, never a wrong or partial answer.
 
 ## Known limitations
 - Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).

@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
@@ -32,6 +33,26 @@ MAX_PROMPT_BYTES = 5_000_000
 # one retry covers a first-attempt blip. Tune via the `goto_retry` JSONL signal.
 DEFAULT_GOTO_TIMEOUT_MS = 90_000
 DEFAULT_GOTO_RETRIES = 1
+
+# Post-send page/tab-close recovery. If the user closes this worker's Chrome tab
+# mid-run, the worker reopens the *same* captured conversation URL in a fresh tab
+# and resumes monitoring — never re-pasting or re-sending (a resend burns another
+# 5-20 min of Pro reasoning). Bounded so a repeatedly-closed window can't loop
+# forever; every recovery await is capped by the ORIGINAL generation deadline, so
+# recovery never grants a fresh budget. 3 tolerates an accidental repeated close;
+# it is safe only because all recovery awaits are deadline-bounded. See
+# _monitor_and_finalize / _recover_navigate / classify_recovery.
+MAX_PAGE_RECOVERIES = 3
+# The latest assistant text must sit unchanged this long before the completion
+# gate even *checks* for the no-Stop-button + Copy-button-present signals. Named
+# so tests can drive completion without waiting the wall-clock interval.
+COMPLETION_STABLE_SECS = 5.0
+# The only URL shape recovery will reopen: a canonical ChatGPT conversation route.
+# Matched exactly (not a prefix) and stripped of query/fragment so a benign
+# ?model=... or #frag can't repoint recovery at a different conversation. A home
+# URL, a login redirect, a foreign host, embedded credentials, or a non-default
+# port all fail this and are never persisted or reopened.
+CONVERSATION_ID_RE = re.compile(r"^/c/([A-Za-z0-9-]+)$")
 
 CHROME_APP = "/Applications/Google Chrome.app"
 LAUNCH_DEBUG_PORT = 19222
@@ -379,6 +400,106 @@ def atomic_write(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
+class RunPageClosed(Exception):
+    """The worker's page/tab was closed during the post-send phase.
+
+    Distinct from a generic worker_exception so the swallow-to-sentinel helpers
+    (`served_assistant_model_slug`, `_copy_button_present`, `read_latest_assistant_text`,
+    ...) can re-raise a *close* instead of laundering it into an empty read, a
+    "Copy button absent", or a fail-open "unverified" model audit. The recovery
+    loop in `_run_with_browser` catches it and reopens the captured conversation
+    on a fresh tab. A *live-page* transient (page still open) is NOT this — those
+    keep their conservative sentinel so a momentary DOM/eval hiccup doesn't
+    trigger a needless tab reopen.
+    """
+
+
+def parse_conversation_url(url: str | None) -> str | None:
+    """Return the canonical `https://chatgpt.com/c/<id>` form of `url`, or None.
+
+    The single gate for what recovery is allowed to reopen. Validates scheme,
+    host (exact, so embedded credentials or a non-default port are rejected via
+    the netloc mismatch), and an exact `/c/<id>` path; query/fragment are
+    dropped so recovery reopens the same conversation id regardless of benign
+    trailing params. A home URL (`/`), a `/auth/login` redirect, or a foreign
+    host all return None → never captured, never reopened.
+    """
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if p.scheme != "https" or p.netloc != "chatgpt.com":
+        return None
+    m = CONVERSATION_ID_RE.match(p.path or "")
+    if not m:
+        return None
+    return f"https://chatgpt.com/c/{m.group(1)}"
+
+
+class _ConversationUrl:
+    """Captures the first valid conversation URL seen after Send.
+
+    Immutable once set: a later navigation (e.g. a stray redirect) cannot
+    repoint recovery at a different conversation. `capture` is memory-only and
+    idempotent so it is safe to call from the *synchronous* `framenavigated`
+    observer AND from the monitor poll (the two cover each other's timing gaps).
+    `persist` does the one-time log + `conversation.json` write from normal async
+    control flow — the disk artifact is a diagnostic breadcrumb for manual
+    recovery, NOT load-bearing state (nothing re-spawns the worker from it).
+    """
+
+    def __init__(self):
+        self._url: str | None = None
+        self._persisted = False
+
+    def capture(self, raw_url: str | None) -> None:
+        if self._url is None:
+            canon = parse_conversation_url(raw_url)
+            if canon:
+                self._url = canon
+
+    def persist(self, run_dir: Path) -> None:
+        if self._url and not self._persisted:
+            self._persisted = True
+            log_stage("conversation_url_captured")
+            try:
+                atomic_write(
+                    run_dir / "conversation.json",
+                    json.dumps({"url": self._url, "captured_at": time.time()}),
+                )
+            except Exception:
+                pass
+
+    def get(self) -> str | None:
+        return self._url
+
+
+def classify_recovery(conv_url: str | None, recoveries: int, max_recoveries: int, remaining: float) -> str:
+    """Decide the next action after a detected page close. Pure so the branch
+    logic is unit-tested without a browser:
+
+    - "no_url"    — no validated conversation URL was captured → terminate,
+                    never guess a conversation. (Message may have been sent; we
+                    fail closed rather than resubmit.)
+    - "deadline"  — the original generation budget is spent → return a timeout,
+                    never a fresh budget.
+    - "exhausted" — the bounded recovery count is used up → terminate.
+    - "recover"   — reopen the captured conversation on a fresh tab.
+
+    Order matters: no_url and deadline are terminal regardless of remaining
+    budget; the exhaustion check only applies once a URL exists and time remains.
+    """
+    if not conv_url:
+        return "no_url"
+    if remaining <= 0:
+        return "deadline"
+    if recoveries >= max_recoveries:
+        return "exhausted"
+    return "recover"
+
+
 def gen_run_id() -> str:
     # 4 hex chars from os.urandom prevent collision when two `ask` calls fire
     # in the same wall-clock second without --run-id.
@@ -655,6 +776,11 @@ async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
             await asyncio.sleep(0.2)
         return model or None
     except Exception:
+        # In the served-slug audit fallback, a close must recover rather than
+        # read as "menu unreadable" (which fail-opens). `doctor` catches this as
+        # a red "failed" status, which is also correct.
+        if page.is_closed():
+            raise RunPageClosed()
         return None
     finally:
         try:
@@ -1004,6 +1130,11 @@ async def served_assistant_model_slug(page) -> str | None:
             return last ? last.getAttribute('data-message-model-slug') : null;
         }""")
     except Exception:
+        # A CLOSED page here would otherwise degrade to a fail-open "unverified"
+        # audit (slug None + menu None) and return a wrong-model turn as ok. Raise
+        # so the recovery loop reopens and re-audits. A live-page miss keeps None.
+        if page.is_closed():
+            raise RunPageClosed()
         return None
 
 
@@ -1027,6 +1158,11 @@ async def _copy_button_present(page) -> bool:
             return !!container.querySelector('[data-testid="copy-turn-action-button"]');
         }""")
     except Exception:
+        # A close must not read as "not yet complete" — that would spin the
+        # monitor to the deadline. Raise so the loop recovers; a live-page miss
+        # stays False (conservatively "not complete yet").
+        if page.is_closed():
+            raise RunPageClosed()
         return False
 
 
@@ -1064,6 +1200,10 @@ async def _copy_button_extract(page) -> str | None:
                 return true;
             }""")
         except Exception:
+            # A close mid-extract must recover, not silently downgrade a clean
+            # markdown answer to stale innerText. A live-page miss keeps None.
+            if page.is_closed():
+                raise RunPageClosed()
             return None
         if not clicked:
             return None
@@ -1240,6 +1380,304 @@ async def _goto_with_retry(
             log_stage("goto_retry", url=url, attempt=attempt + 1, timeout_ms=timeout_ms)
 
 
+def _attach_response_logger(page, network_log: list) -> None:
+    """Wire the network-response logger onto a page. Reused for the initial tab
+    and every replacement tab so recovered pages keep populating network.json."""
+    page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
+
+
+async def read_latest_assistant_text(page) -> str:
+    """Latest assistant turn's innerText, or "" on a *live-page* transient read
+    failure. Raises RunPageClosed if the tab was closed — so the monitor loop
+    reopens the conversation instead of silently treating the close as empty
+    text (the old bug: every poll returned "" and the run spun to the deadline).
+    """
+    try:
+        return await page.evaluate(
+            """() => {
+                const e = document.querySelectorAll('[data-message-author-role="assistant"]');
+                return e.length ? e[e.length - 1].innerText : '';
+            }"""
+        )
+    except Exception:
+        if page.is_closed():
+            raise RunPageClosed()
+        return ""
+
+
+async def _stop_button_count(page) -> int:
+    """Count of visible Stop buttons (0 == generation not actively streaming).
+    Raises RunPageClosed on a closed tab; a live-page failure returns 1 so an
+    ambiguous read is treated conservatively as "still running" and never
+    false-completes a turn."""
+    try:
+        return await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
+    except Exception:
+        if page.is_closed():
+            raise RunPageClosed()
+        return 1
+
+
+async def _recover_navigate(ctx, page, conv_url: str, *, deadline: float) -> str | None:
+    """Reopen the captured conversation on a replacement `page`. Returns None on
+    success, or a failure-reason string:
+
+    - "closed"       — the replacement tab was itself closed mid-recovery.
+    - "deadline"     — the original generation budget ran out (→ caller returns a
+                       timeout, never a fresh budget).
+    - "nav_timeout" / "nav_error" — navigation failed on a live tab.
+    - "redirect"     — landed somewhere that is not the SAME conversation.
+    - "auth_lost"    — session dropped (a login redirect can briefly keep /c/<id>).
+    - "shell_missing"— the conversation DOM never rendered a message turn; feeding
+                       that empty page into the monitor would just spin to the
+                       deadline, so fail closed instead.
+
+    Safe to retry: this is a GET of an existing conversation, never a submission.
+    Every await is capped by the remaining deadline so recovery cannot extend the
+    generation budget.
+    """
+    loop = asyncio.get_running_loop()
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return "deadline"
+    nav_timeout_ms = int(min(DEFAULT_GOTO_TIMEOUT_MS / 1000.0, remaining) * 1000)
+    try:
+        await page.goto(conv_url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+    except PlaywrightTimeoutError:
+        return "closed" if page.is_closed() else "nav_timeout"
+    except Exception:
+        return "closed" if page.is_closed() else "nav_error"
+
+    # pin_viewport_cdp and is_logged_in are the two awaits between the bounded
+    # goto and the bounded shell-wait; cap BOTH by the remaining deadline so the
+    # "every recovery await is deadline-bounded" invariant is literally true and
+    # a wedged CDP session can't overrun the generation budget (belt-and-braces:
+    # the deadline is never reset, so an overrun would still self-correct to a
+    # timeout — but the invariant should hold in code, not just in effect). pin
+    # is best-effort, so a timeout there is swallowed; an auth check that can't
+    # complete in budget fails closed as auth_lost.
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return "deadline"
+    try:
+        await asyncio.wait_for(pin_viewport_cdp(ctx, page), timeout=max(0.5, min(10.0, remaining)))
+    except Exception:
+        pass  # best-effort viewport pin; the OS --window-size is a sane fallback
+
+    # URL equality is necessary but NOT sufficient — validate the canonical id
+    # (ignoring query/fragment) so a redirect to home/login/another conversation
+    # is caught even if the address bar still momentarily reads /c/<id>.
+    if parse_conversation_url(page.url) != conv_url:
+        return "redirect"
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return "deadline"
+    try:
+        if not await asyncio.wait_for(is_logged_in(ctx), timeout=max(0.5, min(10.0, remaining))):
+            return "auth_lost"
+    except Exception:
+        return "closed" if page.is_closed() else "auth_lost"
+
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return "deadline"
+    try:
+        await page.wait_for_selector(
+            "[data-message-author-role]",
+            timeout=int(min(30.0, remaining) * 1000),
+            state="attached",
+        )
+    except PlaywrightTimeoutError:
+        return "closed" if page.is_closed() else "shell_missing"
+    except Exception:
+        return "closed" if page.is_closed() else "shell_missing"
+    return None
+
+
+async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, conv, err) -> dict:
+    """Post-send monitor + finalize on `page`. Returns a terminal result dict, or
+    raises RunPageClosed if the tab closes (the recovery loop reopens + retries).
+
+    Receives NO prompt text, composer, or Send handle: it is *structurally*
+    incapable of re-pasting or re-sending. The absolute `deadline` is passed in
+    and never reset, so re-running this after a recovery keeps the original
+    generation budget. Re-running after completion is idempotent — the completed
+    turn re-detects immediately (Copy button present) and response.md is
+    overwritten atomically.
+    """
+    loop = asyncio.get_running_loop()
+    last_text = ""
+    last_change = loop.time()
+    snapshot_idx = 0
+    next_snap = loop.time() + 5.0
+    completed = False
+    while loop.time() < deadline:
+        now = loop.time()
+        # Backup URL capture (covers a missed framenavigated event) + one-time
+        # persist. Idempotent and immutable once set.
+        conv.capture(page.url)
+        conv.persist(run_dir)
+        if now >= next_snap:
+            await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
+            snapshot_idx += 1
+            next_snap = now + 30.0
+        cur = await read_latest_assistant_text(page)
+        if cur != last_text:
+            last_change = now
+            last_text = cur
+        if cur and (now - last_change) >= COMPLETION_STABLE_SECS:
+            if await _stop_button_count(page) == 0 and await _copy_button_present(page):
+                completed = True
+                break
+        await asyncio.sleep(1.5)
+
+    log_stage(
+        "completion_detected" if completed else "completion_timeout",
+        chars=len(last_text),
+        elapsed_secs=round(loop.time() - send_ts, 1),
+    )
+    await safe_screenshot(page, run_dir / "final.png")
+    try:
+        final_html = await page.content()
+    except Exception:
+        if page.is_closed():
+            raise RunPageClosed()
+        final_html = ""
+    (run_dir / "final.html").write_text(final_html)
+
+    # Defense-in-depth against post-recovery drift: _recover_navigate validates
+    # the conversation once, but if the reopened background tab were later
+    # navigated to a DIFFERENT /c/<id> (e.g. a human grabbed it), extracting and
+    # auditing here would return another conversation's answer as ok — the worst
+    # failure class. page.url is a cached property (no channel call, never
+    # raises); both sides are canonicalized. Fail closed on a mismatch. On the
+    # first, non-recovered pass this is a no-op (page.url == the captured URL).
+    captured = conv.get()
+    if captured and parse_conversation_url(page.url) != captured:
+        await safe_screenshot(page, run_dir / "error-conversation_drift.png")
+        log_stage("error", reason="conversation_drift", expected=captured, actual=page.url)
+        return err("conversation_drift", {"expected": captured, "actual": page.url})
+
+    extraction = "innertext"
+    response = last_text
+    if completed:
+        copied = await _copy_button_extract(page)
+        if copied is not None:
+            response = copied
+            extraction = "copy_button"
+    log_stage("extracted", method=extraction, chars=len(response))
+    atomic_write(run_dir / "response.md", response)
+
+    # Authoritative post-hoc audit: the served assistant turn stamps the model
+    # that actually answered. A close during the audit raises RunPageClosed (not
+    # a fail-open "unverified"), so we reopen and re-audit rather than return a
+    # wrong-model answer as ok.
+    served_slug = await served_assistant_model_slug(page)
+    log_stage("served_model", slug=served_slug)
+
+    menu_model = None
+    if not served_slug:
+        menu_model = await read_selected_model(page, timeout=10.0)
+    model_audit = classify_served_audit(served_slug, menu_model)
+
+    if model_audit in ("slug_mismatch", "menu_mismatch"):
+        reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
+        await safe_screenshot(page, run_dir / f"error-{reason}.png")
+        log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
+        return err(reason,
+                   {"served_slug": served_slug, "menu_model": menu_model,
+                    "completed": completed, "response_chars": len(response)})
+
+    if completed and model_audit != "verified":
+        log_stage("served_model_unverified", model_audit=model_audit)
+
+    result = {
+        "status": "ok" if completed else "timeout",
+        "run_id": run_id,
+        "url": page.url,
+        "run_dir": str(run_dir),
+        "response_chars": len(response),
+        "extraction": extraction,
+        "model_audit": model_audit,
+        "exit_code": 0 if completed else 3,
+    }
+    log_stage("finished", status=result["status"])
+    return result
+
+
+async def _run_postsend(ctx, page, *, run_dir, run_id, deadline, send_ts, conv, network_log, err) -> tuple[dict, object]:
+    """Drive `_monitor_and_finalize` with bounded page-close recovery.
+
+    Returns `(result, latest_owned_page)`. The caller MUST close the returned
+    page (not its original handle): recovery rebinds to fresh tabs, so the
+    returned page is the only one still owned — closing it keeps the existing
+    bounded `finally` leak-safe. Receives NO prompt/composer/send handle, so it
+    is structurally incapable of re-pasting or re-sending; the original absolute
+    `deadline` is threaded through unchanged (recovery never grants a fresh
+    budget). Extracted from `_run_with_browser` so the recovery control flow —
+    budget accounting, rebind, terminal reasons — is unit-testable with fakes.
+    """
+    loop = asyncio.get_running_loop()
+    recoveries = 0
+
+    def _timeout(conv_url):
+        log_stage("completion_timeout", reason="deadline_during_recovery", conversation_url=conv_url)
+        return {"status": "timeout", "run_id": run_id, "url": conv_url,
+                "run_dir": str(run_dir), "reason": "deadline_during_recovery", "exit_code": 3}
+
+    while True:
+        try:
+            result = await _monitor_and_finalize(
+                page, run_dir=run_dir, run_id=run_id,
+                deadline=deadline, send_ts=send_ts, conv=conv, err=err,
+            )
+            return result, page
+        except RunPageClosed:
+            # Reopen loop: re-classify after EACH reopen attempt without
+            # re-entering the monitor on a tab already known dead (a
+            # closed-during-nav reopen). The old `continue`-to-monitor path
+            # spent an extra recovery slot on that no-op round-trip.
+            while True:
+                conv_url = conv.get()
+                remaining = deadline - loop.time()
+                decision = classify_recovery(conv_url, recoveries, MAX_PAGE_RECOVERIES, remaining)
+                if decision == "no_url":
+                    log_stage("error", reason="page_closed_before_conversation_url")
+                    return err("page_closed_before_conversation_url"), page
+                if decision == "deadline":
+                    return _timeout(conv_url), page
+                if decision == "exhausted":
+                    log_stage("error", reason="page_recovery_exhausted", attempts=recoveries)
+                    return err("page_recovery_exhausted",
+                               {"conversation_url": conv_url, "attempts": recoveries}), page
+                recoveries += 1
+                log_stage("page_recovery_attempt", attempt=recoveries, conversation_url=conv_url)
+                # A fresh tab in the SAME context proves the browser/CDP survived
+                # (vs a full disconnect). Rebind `page` to the new tab BEFORE
+                # navigating so the returned page is always the latest owned one.
+                try:
+                    page = await asyncio.wait_for(ctx.new_page(), timeout=min(30.0, remaining))
+                except Exception as e:
+                    log_stage("error", reason="browser_disconnected_after_send",
+                              exception=f"{type(e).__name__}: {e}")
+                    return err("browser_disconnected_after_send", {"conversation_url": conv_url}), page
+                _attach_response_logger(page, network_log)
+                nav_reason = await _recover_navigate(ctx, page, conv_url, deadline=deadline)
+                if nav_reason == "closed":
+                    # Reopened tab closed during nav — re-classify (inner loop),
+                    # consuming exactly one slot, no dead-monitor round-trip.
+                    log_stage("page_recovery_failed", attempt=recoveries, reason="closed_during_nav")
+                    continue
+                if nav_reason == "deadline":
+                    return _timeout(conv_url), page
+                if nav_reason is not None:
+                    log_stage("page_recovery_failed", attempt=recoveries, reason=nav_reason)
+                    return err("page_recovery_failed",
+                               {"conversation_url": conv_url, "recovery_reason": nav_reason}), page
+                log_stage("page_recovery_succeeded", attempt=recoveries)
+                break  # reopened OK → outer loop re-runs the monitor on the new page
+
+
 async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot_id) -> dict:
     def exc(e: Exception) -> dict:
         return err("worker_exception", {"exception": f"{type(e).__name__}: {e}"})
@@ -1261,7 +1699,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
             # concurrent worker's mid-paste keystroke. Screenshots work on
             # background tabs in a windowed Chrome.
             try:
-                page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
+                _attach_response_logger(page, network_log)
                 log_stage("chrome_connected")
 
                 await _goto_with_retry(page, "https://chatgpt.com/")
@@ -1347,112 +1785,65 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 send_btn = page.locator(
                     '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
                 ).first
-                await send_btn.click()
-                send_ts = time.time()
-                log_stage("sent")
 
-                deadline = time.time() + DEFAULT_GENERATION_TIMEOUT
-                last_text = ""
-                last_change = time.time()
-                snapshot_idx = 0
-                next_snap = time.time() + 5.0
-                completed = False
-                while time.time() < deadline:
-                    now = time.time()
-                    if now >= next_snap:
-                        await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
-                        snapshot_idx += 1
-                        next_snap = now + 30.0
+                # Register the conversation-URL observer BEFORE the click so a fast
+                # /  ->  /c/<id> pushState transition cannot be missed. The handler
+                # is synchronous and memory-only (idempotent); disk persistence
+                # happens from the monitor loop's async flow. Bound to THIS page via
+                # a default arg so a later `page` rebind (recovery) can't misroute it.
+                conv = _ConversationUrl()
+
+                def _on_frame_navigated(frame, _observed=page):
                     try:
-                        cur = await page.evaluate(
-                            """() => {
-                                const e = document.querySelectorAll('[data-message-author-role="assistant"]');
-                                return e.length ? e[e.length - 1].innerText : '';
-                            }"""
-                        )
+                        if frame is _observed.main_frame:
+                            conv.capture(frame.url)
                     except Exception:
-                        cur = ""
-                    if cur != last_text:
-                        last_change = now
-                        last_text = cur
-                    if cur and (now - last_change) >= 5.0:
-                        stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
-                        if stop == 0 and await _copy_button_present(page):
-                            completed = True
-                            break
-                    await asyncio.sleep(1.5)
+                        pass
 
-                log_stage(
-                    "completion_detected" if completed else "completion_timeout",
-                    chars=len(last_text),
-                    elapsed_secs=round(time.time() - send_ts, 1),
+                page.on("framenavigated", _on_frame_navigated)
+
+                # ---- Send: the single irreversible step. The absolute deadline is
+                # created BEFORE the click (monotonic clock) so an ambiguous close —
+                # the click can dispatch the request and THEN raise on tab-close —
+                # still carries a budget. Nothing past this point pastes or sends
+                # again: the post-send helper receives no prompt/composer/send handle.
+                loop = asyncio.get_running_loop()
+                send_ts = loop.time()
+                deadline = send_ts + DEFAULT_GENERATION_TIMEOUT
+                try:
+                    await send_btn.click()
+                except Exception as e:
+                    # "The click raised" is NOT proof the send didn't happen. If a
+                    # valid conversation URL was already captured, the message is in
+                    # flight — recover it (never resubmit). Otherwise fail closed as
+                    # send_outcome_unknown; never guess a conversation or resend.
+                    conv.capture(page.url)
+                    if page.is_closed() and conv.get():
+                        conv.persist(run_dir)
+                        log_stage("send_click_raised_after_capture",
+                                  exception=f"{type(e).__name__}: {e}")
+                    elif page.is_closed():
+                        log_stage("error", reason="send_outcome_unknown",
+                                  exception=f"{type(e).__name__}: {e}")
+                        return err("send_outcome_unknown", {"exception": f"{type(e).__name__}: {e}"})
+                    else:
+                        raise
+                else:
+                    log_stage("sent")
+                    conv.capture(page.url)
+                    conv.persist(run_dir)
+
+                # ---- Post-send monitor + finalize, with bounded page-close
+                # recovery. On a detected tab close, reopen the SAME captured
+                # conversation on a fresh tab and re-run finalization; the original
+                # deadline is preserved across every attempt (recovery never grants
+                # a fresh budget). `_run_postsend` returns the LATEST owned page so
+                # the `finally` below closes the current tab, not a stale handle.
+                result, page = await _run_postsend(
+                    ctx, page, run_dir=run_dir, run_id=run_id,
+                    deadline=deadline, send_ts=send_ts, conv=conv,
+                    network_log=network_log, err=err,
                 )
-                await safe_screenshot(page, run_dir / "final.png")
-                (run_dir / "final.html").write_text(await page.content())
-
-                extraction = "innertext"
-                response = last_text
-                if completed:
-                    copied = await _copy_button_extract(page)
-                    if copied is not None:
-                        response = copied
-                        extraction = "copy_button"
-                log_stage("extracted", method=extraction, chars=len(response))
-                atomic_write(run_dir / "response.md", response)
-
-                # Authoritative post-hoc audit: the served assistant turn stamps
-                # the model that actually answered. The pre-send chip gate can
-                # still be defeated by a flip in its tiny read→click window or by
-                # a server-side downgrade that ignores the chip entirely.
-                served_slug = await served_assistant_model_slug(page)
-                log_stage("served_model", slug=served_slug)
-
-                # When the authoritative slug is ABSENT (attribute rename / not
-                # stamped), the chip proves neither model nor effort, so fall back
-                # to an independent read-only chip-menu model read — the same
-                # signal `doctor` uses. This closes the missing-slug wrong-model
-                # hole without bricking on a slug rename: only a *confirmed* non-Sol
-                # model is fatal; Sol or an unreadable menu preserves the fail-open.
-                menu_model = None
-                if not served_slug:
-                    menu_model = await read_selected_model(page, timeout=10.0)
-                model_audit = classify_served_audit(served_slug, menu_model)
-
-                # A present non-Pro slug, OR a missing slug whose menu fallback
-                # confirms a non-Sol model, is authoritative contamination — fail
-                # closed regardless of `completed`, so a timed-out wrong-model turn
-                # is never quietly reported as a plain timeout. response.md is kept
-                # as a diagnostic artifact; the result is an error so it is never
-                # printed as a success.
-                if model_audit in ("slug_mismatch", "menu_mismatch"):
-                    reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
-                    await safe_screenshot(page, run_dir / f"error-{reason}.png")
-                    log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
-                    return err(reason,
-                               {"served_slug": served_slug, "menu_model": menu_model,
-                                "completed": completed, "response_chars": len(response)})
-
-                # Remaining non-"verified" verdicts are fail-OPEN — a missing slug
-                # (even with the menu confirming Sol) leaves the *effort* unverified,
-                # and a double selector break leaves everything unverified. Making
-                # these fatal would brick the tool on a single attribute rename, the
-                # exact blast radius the network-body-gate alternative was rejected
-                # for. Mark them explicitly so a caller can't mistake an unaudited
-                # answer for a verified one, and emit a distinct greppable stage.
-                if completed and model_audit != "verified":
-                    log_stage("served_model_unverified", model_audit=model_audit)
-
-                result = {
-                    "status": "ok" if completed else "timeout",
-                    "run_id": run_id,
-                    "url": page.url,
-                    "run_dir": str(run_dir),
-                    "response_chars": len(response),
-                    "extraction": extraction,
-                    "model_audit": model_audit,
-                    "exit_code": 0 if completed else 3,
-                }
-                log_stage("finished", status=result["status"])
                 return result
             except Exception as e:
                 log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
