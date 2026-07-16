@@ -19,6 +19,7 @@ STATE = Path.home() / ".gpt-pro"
 RUNS = STATE / "runs"
 LAUNCH_LOCK = STATE / "launch.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
+CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -980,55 +981,65 @@ async def cmd_ask(args) -> int:
     run_dir = RUNS / run_id
     prompt_sha = hashlib.sha256(prompt_text.encode()).hexdigest()
 
-    spawn_worker = True
-    if run_dir.exists():
-        meta_path = run_dir / "meta.json"
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-            except json.JSONDecodeError:
-                meta = {}
-            existing_sha = meta.get("prompt_sha256")
-            if existing_sha == prompt_sha:
-                stderr_jsonl({
-                    "status": "submitted",
-                    "run_id": run_id,
-                    "run_dir": str(run_dir),
-                    "prompt_sha256": prompt_sha,
-                    "attached": True,
-                })
-                spawn_worker = False
-            elif existing_sha is not None:
-                stderr_jsonl({
-                    "status": "error",
-                    "reason": "run_id_conflict",
-                    "run_id": run_id,
-                    "run_dir": str(run_dir),
-                })
-                return 2
-            else:
-                # meta.json exists but is missing/corrupt prompt_sha256.
-                # Most likely cause: a prior `ask` was killed between mkdir
-                # and the atomic_write of meta.json. Fail closed rather than
-                # spawn a duplicate worker that would race on result.json.
-                stderr_jsonl({
-                    "status": "error",
-                    "reason": "run_id_conflict_no_sha",
-                    "run_id": run_id,
-                    "run_dir": str(run_dir),
-                    "hint": "Delete the run_dir and retry, or use a fresh --run-id.",
-                })
-                return 2
+    # Decide under the run's claim: the exists/sha test is a check-then-act, so
+    # two concurrent same-run-id submits would otherwise both conclude "new" and
+    # spawn a worker each onto one run_dir. The spawn itself stays OUTSIDE the
+    # claim — the worker takes the same lock, so holding it across the spawn
+    # would make every worker lose to its own parent (see RunClaim). Releasing
+    # early is safe: meta.json has already made the decision durable, so a
+    # racing `ask` reads the attach path instead of re-deciding.
+    with RunClaim(run_id):
+        spawn_worker = True
+        if run_dir.exists():
+            meta_path = run_dir / "meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except json.JSONDecodeError:
+                    meta = {}
+                existing_sha = meta.get("prompt_sha256")
+                if existing_sha == prompt_sha:
+                    stderr_jsonl({
+                        "status": "submitted",
+                        "run_id": run_id,
+                        "run_dir": str(run_dir),
+                        "prompt_sha256": prompt_sha,
+                        "attached": True,
+                    })
+                    spawn_worker = False
+                elif existing_sha is not None:
+                    stderr_jsonl({
+                        "status": "error",
+                        "reason": "run_id_conflict",
+                        "run_id": run_id,
+                        "run_dir": str(run_dir),
+                    })
+                    return 2
+                else:
+                    # meta.json exists but is missing/corrupt prompt_sha256.
+                    # Most likely cause: a prior `ask` was killed between mkdir
+                    # and the atomic_write of meta.json. Fail closed rather than
+                    # spawn a duplicate worker that would race on result.json.
+                    stderr_jsonl({
+                        "status": "error",
+                        "reason": "run_id_conflict_no_sha",
+                        "run_id": run_id,
+                        "run_dir": str(run_dir),
+                        "hint": "Delete the run_dir and retry, or use a fresh --run-id.",
+                    })
+                    return 2
+
+        if spawn_worker:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write(run_dir / "prompt.md", prompt_text)
+            meta = {
+                "run_id": run_id,
+                "created_at": time.time(),
+                "prompt_sha256": prompt_sha,
+            }
+            atomic_write(run_dir / "meta.json", json.dumps(meta))
 
     if spawn_worker:
-        run_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write(run_dir / "prompt.md", prompt_text)
-        meta = {
-            "run_id": run_id,
-            "created_at": time.time(),
-            "prompt_sha256": prompt_sha,
-        }
-        atomic_write(run_dir / "meta.json", json.dumps(meta))
         _spawn_worker(run_id, run_dir)
         stderr_jsonl({
             "status": "submitted",
@@ -1248,23 +1259,33 @@ async def _copy_button_extract(page) -> str | None:
 
 
 class _FlockGuard:
-    """Plain mutual-exclusion fcntl flock context manager. Held briefly only."""
-    def __init__(self, path: Path):
+    """Plain mutual-exclusion fcntl flock context manager. Held briefly only.
+
+    `blocking=False` makes `acquire()` return False on contention instead of
+    waiting — for a guard whose loser has somewhere better to be than a queue.
+    """
+    def __init__(self, path: Path, *, blocking: bool = True):
         self.path = path
+        self.blocking = blocking
         self._fd = None
 
-    def __enter__(self):
+    def acquire(self) -> bool:
+        """Take the lock. Returns False only when non-blocking and contended."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = open(self.path, "w")
+        flags = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(fd.fileno(), flags)
+        except BlockingIOError:
+            fd.close()
+            return False
         except BaseException:
             fd.close()
             raise
         self._fd = fd
-        return self
+        return True
 
-    def __exit__(self, *_):
+    def release(self) -> None:
         if self._fd is None:
             return
         try:
@@ -1273,12 +1294,49 @@ class _FlockGuard:
             self._fd.close()
             self._fd = None
 
+    def __enter__(self):
+        if not self.acquire():
+            raise BlockingIOError(f"{self.path} is held by another owner")
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
 
 class LaunchLock(_FlockGuard):
     """Held only across the CDP-probe-and-conditional-launch path. Never held during
     a run's per-tab work — that would re-introduce the old whole-section serialization."""
     def __init__(self):
         super().__init__(LAUNCH_LOCK)
+
+
+class RunClaim(_FlockGuard):
+    """Single-writer claim on one run_id. Two roles, one file.
+
+    `ask` holds it **briefly and blocking** across the decision — does run_dir
+    exist, does prompt_sha match, spawn or attach — because that decision is a
+    check-then-act. Without it two concurrent same-run-id submits both observe
+    absence and spawn a worker each; the two workers then share
+    `response.pending.md`, and one can publish the other's body to
+    `response.md` — an answer its own audit never saw.
+
+    `_run` holds it **for the whole run, non-blocking**: it is the claim on the
+    run_dir's artifacts, and it makes the artifact lifecycle's single-writer
+    premise structural rather than conventional. A second worker fails the
+    acquire and exits without touching anything.
+
+    **`ask` MUST release before spawning** — the worker takes this same lock, so
+    holding it across the spawn would make every worker lose to its own parent.
+    Releasing early is safe: the decision is already durable in `meta.json`, so
+    a racing `ask` reads the attach path rather than re-deciding.
+
+    Held per run_id, never globally — two different runs must not serialize.
+    The file outlives the run (an empty lock file in `~/.gpt-pro/claims/`);
+    flock is released by the kernel on process death, so a SIGKILLed worker
+    leaves no stale claim — the same reason the other three locks are flocks.
+    """
+    def __init__(self, run_id: str, *, blocking: bool = True):
+        super().__init__(CLAIMS / f"{run_id}.lock", blocking=blocking)
 
 
 class UiClipboardLock(_FlockGuard):
@@ -1910,12 +1968,37 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
 async def cmd_run(args) -> int:
     validate_run_id(args.run_id)
     run_dir = RUNS / args.run_id
+    # Claim the run for this worker's whole lifetime — this is what makes the
+    # artifact lifecycle's single-writer premise structural. A second worker on
+    # the same run_dir (a hand-run `_run`, a future spawn path) would otherwise
+    # share `response.pending.md` and could publish its body under the other's
+    # verdict. The loser touches NOTHING: writing result.json would race the
+    # owner's verdict, and the owner's result is what its parent is polling for
+    # anyway, so exiting quietly is also the correct outcome for our parent.
+    claim = RunClaim(args.run_id, blocking=False)
+    if not claim.acquire():
+        stderr_jsonl({
+            "status": "error",
+            "reason": "run_already_claimed",
+            "run_id": args.run_id,
+            "run_dir": str(run_dir),
+            "hint": "Another worker owns this run; its result.json is authoritative.",
+        })
+        return 1
+    try:
+        return await _run_claimed(args.run_id, run_dir)
+    finally:
+        claim.release()
+
+
+async def _run_claimed(run_id: str, run_dir: Path) -> int:
+    """The worker body, holding this run's `RunClaim`."""
     prompt_path = run_dir / "prompt.md"
     if not run_dir.exists() or not prompt_path.exists():
         result = {
             "status": "error",
             "reason": "missing_prompt",
-            "run_id": args.run_id,
+            "run_id": run_id,
             "run_dir": str(run_dir),
             "exit_code": 1,
         }
@@ -1924,7 +2007,7 @@ async def cmd_run(args) -> int:
         return 1
 
     prompt_text = prompt_path.read_text()
-    result = await _browser_run(args.run_id, run_dir, prompt_text)
+    result = await _browser_run(run_id, run_dir, prompt_text)
     atomic_write(run_dir / "result.json", json.dumps(result))
     return result.get("exit_code", 1)
 
