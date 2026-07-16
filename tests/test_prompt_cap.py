@@ -27,10 +27,16 @@ def _args(run_id="test-cap"):
 
 @pytest.fixture
 def harness(monkeypatch, tmp_path):
-    """Redirect RUNS to a temp dir; capture stderr_jsonl + _spawn_worker."""
+    """Redirect RUNS + CLAIMS to a temp dir; capture stderr_jsonl + _spawn_worker.
+
+    CLAIMS matters even though nothing here asserts on it: cmd_ask takes a
+    RunClaim, so leaving it unpatched writes a real lock file into the
+    developer's ~/.gpt-pro/claims/.
+    """
     runs = tmp_path / "runs"
     runs.mkdir()
     monkeypatch.setattr(cli, "RUNS", runs)
+    monkeypatch.setattr(cli, "CLAIMS", tmp_path / "claims")
     emitted = []
     monkeypatch.setattr(cli, "stderr_jsonl", lambda d: emitted.append(d))
     spawned = []
