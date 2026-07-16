@@ -400,6 +400,26 @@ def atomic_write(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
+# The extraction is staged here and published under an outcome-specific name
+# only once the run's outcome is known (see `publish_response`).
+RESPONSE_STAGED = "response.pending.md"
+
+
+def publish_response(run_dir: Path, final_name: str) -> None:
+    """Rename the staged extraction to the name its outcome earns.
+
+    `response.md` must mean exactly one thing — a verified, completion-gated
+    answer — because a run's text is not self-describing: a wrong-model turn is
+    complete and plausible, and a turn that missed the Copy-button gate can be
+    fully rendered. Both differ from a real answer only by provenance, so the
+    name is the only signal a caller reading the run_dir actually gets. Every
+    other outcome therefore lands under a name that states what it is. A raise
+    before publication leaves the staged file: diagnostics survive without ever
+    claiming to be the answer.
+    """
+    os.replace(run_dir / RESPONSE_STAGED, run_dir / final_name)
+
+
 class RunPageClosed(Exception):
     """The worker's page/tab was closed during the post-send phase.
 
@@ -1566,7 +1586,7 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
             response = copied
             extraction = "copy_button"
     log_stage("extracted", method=extraction, chars=len(response))
-    atomic_write(run_dir / "response.md", response)
+    atomic_write(run_dir / RESPONSE_STAGED, response)
 
     # Authoritative post-hoc audit: the served assistant turn stamps the model
     # that actually answered. A close during the audit raises RunPageClosed (not
@@ -1582,23 +1602,28 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
 
     if model_audit in ("slug_mismatch", "menu_mismatch"):
         reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
-        # Quarantine the artifact, not just the run: a rejected turn's text is
-        # complete and plausible, differing from a verified answer only by
-        # provenance, so leaving it at `response.md` — the name every consumer
-        # treats as "the answer" — invites a caller to return it anyway.
-        # Renaming makes that require deliberately naming a rejected file. Only
-        # the two FATAL verdicts quarantine; the fail-open ones must keep
-        # response.md or a selector rename bricks the tool.
-        os.replace(run_dir / "response.md", run_dir / "response.rejected.md")
+        # Quarantine the artifact, not just the run — a wrong model is fatal
+        # however complete the turn reads. Only the FATAL verdicts land here;
+        # the fail-open ones publish normally, or a selector rename would brick
+        # the tool. The path is deliberately not reported: `run_dir` plus a
+        # fixed name already locate it for a human, while a `*_response` field
+        # hands an automation agent the salvage target it must not read.
+        publish_response(run_dir, "response.rejected.md")
         await safe_screenshot(page, run_dir / f"error-{reason}.png")
         log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
         return err(reason,
                    {"served_slug": served_slug, "menu_model": menu_model,
-                    "completed": completed, "response_chars": len(response),
-                    "rejected_response": str(run_dir / "response.rejected.md")})
+                    "completed": completed, "response_chars": len(response)})
 
     if completed and model_audit != "verified":
         log_stage("served_model_unverified", model_audit=model_audit)
+
+    # Publish under the name this outcome earns. `completed` is exactly the
+    # `status: ok` condition (a fatal audit already returned), and it is the
+    # Copy-button gate — so a turn that missed it is `response.partial.md` even
+    # when fully rendered, which is the case the gate exists to catch (a Pro
+    # thinking-summary reads as a complete short answer; cf. reframe-review-040).
+    publish_response(run_dir, "response.md" if completed else "response.partial.md")
 
     result = {
         "status": "ok" if completed else "timeout",

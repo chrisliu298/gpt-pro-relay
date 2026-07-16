@@ -141,8 +141,9 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 - `prompt.md` — input
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
-- `response.md` — extracted assistant message (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
-- `result.json` — terminal status (atomic)
+- `response.md` — the answer, and **only** ever a verified, completed one (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
+- `result.json` — terminal status (atomic). **It is the authority: only `status: "ok"` makes `response.md` usable.**
+- `response.rejected.md` / `response.partial.md` / `response.pending.md` — the same extracted text under the name its outcome earned: the served model failed the audit, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. A run publishes exactly one of these four names, so the name tells you what you have without reading `result.json` first — but the text is no help: a wrong-model turn is complete and plausible, and a turn that missed the Copy-button gate can be fully rendered.
 - `conversation.json` — `{url, captured_at}`, the ChatGPT conversation this run submitted to. Diagnostic breadcrumb for manual recovery; written once the URL is known.
 - `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
 - `final.html` — last DOM snapshot

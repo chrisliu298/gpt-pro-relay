@@ -474,144 +474,153 @@ async def test_monitor_conversation_drift_fails_closed(_finalize_env, tmp_path):
     assert not (tmp_path / "response.md").exists()
 
 
-async def test_monitor_quarantines_answer_on_model_mismatch(_finalize_env, tmp_path):
-    # A rejected turn's text is COMPLETE and plausible — it differs from a
-    # verified answer only by provenance. Rejecting the run is not enough: the
-    # artifact must not survive under `response.md`, the name every consumer
-    # treats as "the answer" (run ask-20260716T034413Z, 2026-07-15: a caller hit
-    # this reason and reached for response.md out of the run dir). Quarantine it
-    # so reading it back requires deliberately naming a file marked rejected.
-    import asyncio
-    _finalize_env.setattr(cli, "COMPLETION_STABLE_SECS", 0.0)
+def _fake_turn(env, *, text, copied=None, slug=None, menu=None, copy_present=True):
+    """Wire the page-facing helpers `_monitor_and_finalize` calls for one turn.
 
+    `slug`/`menu` may be a value or an exception instance to raise (a page close
+    during the audit). `copy_present=False` starves the completion gate, which
+    is how a fully-rendered answer still times out when the selector drifts.
+    """
     async def _text(_page):
-        return "wrong-model answer"
+        return text
 
     async def _stop(_page):
         return 0
 
     async def _copy_present(_page):
-        return True
+        return copy_present
 
     async def _copy_extract(_page):
-        return "wrong-model answer (markdown)"
+        return copied
 
     async def _slug(_page):
-        return "gpt-5-5-pro"  # served, but not in PRO_MODEL_SLUGS
+        if isinstance(slug, BaseException):
+            raise slug
+        return slug
 
-    _finalize_env.setattr(cli, "read_latest_assistant_text", _text)
-    _finalize_env.setattr(cli, "_stop_button_count", _stop)
-    _finalize_env.setattr(cli, "_copy_button_present", _copy_present)
-    _finalize_env.setattr(cli, "_copy_button_extract", _copy_extract)
-    _finalize_env.setattr(cli, "served_assistant_model_slug", _slug)
+    async def _menu(_page, timeout=10.0):
+        if isinstance(menu, BaseException):
+            raise menu
+        return menu
 
-    page = _FinalizePage()
-    conv = _ConversationUrl()
-    deadline = asyncio.get_running_loop().time() + 100.0
-    result = await _monitor_and_finalize(
-        page, run_dir=tmp_path, run_id="r1",
-        deadline=deadline, send_ts=asyncio.get_running_loop().time(),
-        conv=conv, err=_noop_err,
+    env.setattr(cli, "COMPLETION_STABLE_SECS", 0.0)
+    env.setattr(cli, "read_latest_assistant_text", _text)
+    env.setattr(cli, "_stop_button_count", _stop)
+    env.setattr(cli, "_copy_button_present", _copy_present)
+    env.setattr(cli, "_copy_button_extract", _copy_extract)
+    env.setattr(cli, "served_assistant_model_slug", _slug)
+    env.setattr(cli, "read_selected_model", _menu)
+
+
+async def _finalize(tmp_path, *, budget=100.0):
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await _monitor_and_finalize(
+        _FinalizePage(), run_dir=tmp_path, run_id="r1",
+        deadline=loop.time() + budget, send_ts=loop.time(),
+        conv=_ConversationUrl(), err=_noop_err,
     )
+
+
+def _artifacts(run_dir):
+    """Which response artifact(s) a run published. `response.md` means exactly
+    one thing — a verified, completion-gated answer — so the whole point is that
+    every other outcome lands under a different name."""
+    return {p.name for p in run_dir.glob("response*.md")}
+
+
+async def test_monitor_publishes_canonical_only_when_verified_and_complete(_finalize_env, tmp_path):
+    _fake_turn(_finalize_env, text="the answer", copied="the answer (markdown)",
+               slug="gpt-5-6-pro")
+    result = await _finalize(tmp_path)
+    assert result["status"] == "ok"
+    assert result["model_audit"] == "verified"
+    assert _artifacts(tmp_path) == {"response.md"}
+    assert (tmp_path / "response.md").read_text() == "the answer (markdown)"
+
+
+async def test_monitor_quarantines_answer_on_model_mismatch(_finalize_env, tmp_path):
+    # A rejected turn's text is COMPLETE and plausible — it differs from a
+    # verified answer only by provenance. Rejecting the run is not enough: the
+    # artifact must not reach `response.md`, the name every consumer treats as
+    # "the answer" (run ask-20260716T034413Z, 2026-07-15: a caller hit this
+    # reason and reached for response.md out of the run dir).
+    _fake_turn(_finalize_env, text="wrong-model answer",
+               copied="wrong-model answer (markdown)", slug="gpt-5-5-pro")
+    result = await _finalize(tmp_path)
     assert result["reason"] == "served_model_mismatch"
     assert result["served_slug"] == "gpt-5-5-pro"
-    # The run is rejected AND the artifact is quarantined, not merely unread.
-    assert not (tmp_path / "response.md").exists()
-    rejected = tmp_path / "response.rejected.md"
-    assert rejected.read_text() == "wrong-model answer (markdown)"
-    # Still counted, so the reason line reports what was thrown away.
+    assert _artifacts(tmp_path) == {"response.rejected.md"}
+    assert (tmp_path / "response.rejected.md").read_text() == "wrong-model answer (markdown)"
+    # Reporting the path would hand a recovery agent the salvage target in a
+    # field named for the answer; run_dir + the fixed name already suffice.
+    assert "rejected_response" not in result
     assert result["response_chars"] == len("wrong-model answer (markdown)")
 
 
 async def test_monitor_quarantines_answer_on_menu_mismatch(_finalize_env, tmp_path):
     # Same quarantine on the slug-absent branch: the menu confirmed a non-Sol
-    # model, which is equally fatal and equally salvageable off disk.
-    import asyncio
-    _finalize_env.setattr(cli, "COMPLETION_STABLE_SECS", 0.0)
-
-    async def _text(_page):
-        return "wrong-model answer"
-
-    async def _stop(_page):
-        return 0
-
-    async def _copy_present(_page):
-        return True
-
-    async def _copy_extract(_page):
-        return "wrong-model answer (markdown)"
-
-    async def _no_slug(_page):
-        return None
-
-    async def _menu(_page, timeout=10.0):
-        return "GPT-5.5"  # confirmed, and not Sol
-
-    _finalize_env.setattr(cli, "read_latest_assistant_text", _text)
-    _finalize_env.setattr(cli, "_stop_button_count", _stop)
-    _finalize_env.setattr(cli, "_copy_button_present", _copy_present)
-    _finalize_env.setattr(cli, "_copy_button_extract", _copy_extract)
-    _finalize_env.setattr(cli, "served_assistant_model_slug", _no_slug)
-    _finalize_env.setattr(cli, "read_selected_model", _menu)
-
-    page = _FinalizePage()
-    conv = _ConversationUrl()
-    deadline = asyncio.get_running_loop().time() + 100.0
-    result = await _monitor_and_finalize(
-        page, run_dir=tmp_path, run_id="r1",
-        deadline=deadline, send_ts=asyncio.get_running_loop().time(),
-        conv=conv, err=_noop_err,
-    )
+    # model, equally fatal and equally salvageable off disk.
+    _fake_turn(_finalize_env, text="wrong-model answer",
+               copied="wrong-model answer (markdown)", slug=None, menu="GPT-5.5")
+    result = await _finalize(tmp_path)
     assert result["reason"] == "model_menu_mismatch"
-    assert not (tmp_path / "response.md").exists()
-    assert (tmp_path / "response.rejected.md").read_text() == "wrong-model answer (markdown)"
+    assert _artifacts(tmp_path) == {"response.rejected.md"}
 
 
-async def test_monitor_keeps_answer_on_fail_open_audit(_finalize_env, tmp_path):
-    # The fail-OPEN verdicts must NOT quarantine: a double selector break
-    # (slug attribute renamed AND menu unreadable) returns ok by design, so
-    # `response.md` has to remain the answer. Pins that the quarantine tracks
-    # the fatal branches only and can't brick the tool on a rename.
-    import asyncio
-    _finalize_env.setattr(cli, "COMPLETION_STABLE_SECS", 0.0)
-
-    async def _text(_page):
-        return "the answer"
-
-    async def _stop(_page):
-        return 0
-
-    async def _copy_present(_page):
-        return True
-
-    async def _copy_extract(_page):
-        return "the answer (markdown)"
-
-    async def _no_slug(_page):
-        return None
-
-    async def _menu_unreadable(_page, timeout=10.0):
-        return None
-
-    _finalize_env.setattr(cli, "read_latest_assistant_text", _text)
-    _finalize_env.setattr(cli, "_stop_button_count", _stop)
-    _finalize_env.setattr(cli, "_copy_button_present", _copy_present)
-    _finalize_env.setattr(cli, "_copy_button_extract", _copy_extract)
-    _finalize_env.setattr(cli, "served_assistant_model_slug", _no_slug)
-    _finalize_env.setattr(cli, "read_selected_model", _menu_unreadable)
-
-    page = _FinalizePage()
-    conv = _ConversationUrl()
-    deadline = asyncio.get_running_loop().time() + 100.0
-    result = await _monitor_and_finalize(
-        page, run_dir=tmp_path, run_id="r1",
-        deadline=deadline, send_ts=asyncio.get_running_loop().time(),
-        conv=conv, err=_noop_err,
-    )
+async def test_monitor_publishes_canonical_on_fail_open_audit(_finalize_env, tmp_path):
+    # The fail-OPEN verdicts must still publish: a double selector break (slug
+    # attribute renamed AND menu unreadable) returns ok by design, so its
+    # terminal status authorizes `response.md`. Pins that the lifecycle tracks
+    # the FATAL verdicts only and can't brick the tool on a rename.
+    _fake_turn(_finalize_env, text="the answer", copied="the answer (markdown)",
+               slug=None, menu=None)
+    result = await _finalize(tmp_path)
     assert result["status"] == "ok"
     assert result["model_audit"] == "unverified_missing_slug"
-    assert (tmp_path / "response.md").read_text() == "the answer (markdown)"
-    assert not (tmp_path / "response.rejected.md").exists()
+    assert _artifacts(tmp_path) == {"response.md"}
+
+
+async def test_monitor_close_during_audit_publishes_nothing(_finalize_env, tmp_path):
+    # The audit reads the page AFTER extraction, so a close there raises before
+    # any verdict exists. The text must not reach `response.md`: it is UNAUDITED
+    # — neither model nor effort is proven — and if recovery then fails to open a
+    # fresh tab the run ends terminally (browser_disconnected_after_send) with
+    # that file as its most answer-looking artifact. It stays staged instead, so
+    # the diagnostic survives without ever claiming to be the answer.
+    _fake_turn(_finalize_env, text="unaudited answer",
+               copied="unaudited answer (markdown)", slug=RunPageClosed())
+    with pytest.raises(RunPageClosed):
+        await _finalize(tmp_path)
+    assert "response.md" not in _artifacts(tmp_path)
+    assert (tmp_path / "response.pending.md").read_text() == "unaudited answer (markdown)"
+
+
+async def test_monitor_timeout_publishes_partial_not_canonical(_finalize_env, tmp_path):
+    # Completion needs the Copy button, so a drifted selector times out a turn
+    # whose text is FULLY rendered — "partial" is not visibly partial (cf. the
+    # 228-char thinking-summary fragment of reframe-review-040). The model is
+    # right here; the answer is simply not completion-gated, so it must not take
+    # the canonical name. Needs a live budget: the monitor loop has to actually
+    # run to accumulate text.
+    rendered = "A complete-looking answer. " * 20
+    _fake_turn(_finalize_env, text=rendered, copy_present=False, slug="gpt-5-6-pro")
+    result = await _finalize(tmp_path, budget=0.25)
+    assert result["status"] == "timeout"
+    assert result["exit_code"] == 3
+    assert _artifacts(tmp_path) == {"response.partial.md"}
+    assert (tmp_path / "response.partial.md").read_text() == rendered
+
+
+async def test_monitor_mismatch_outranks_timeout(_finalize_env, tmp_path):
+    # A wrong model on an ungated turn is a model failure first: the fatal audit
+    # runs regardless of `completed`, so this quarantines rather than publishing
+    # a partial.
+    _fake_turn(_finalize_env, text="wrong-model partial", copy_present=False,
+               slug="gpt-5-5-pro")
+    result = await _finalize(tmp_path, budget=0.25)
+    assert result["reason"] == "served_model_mismatch"
+    assert _artifacts(tmp_path) == {"response.rejected.md"}
 
 
 # ---- _run_postsend recovery-loop control flow ----
