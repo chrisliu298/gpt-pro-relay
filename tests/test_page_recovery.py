@@ -612,6 +612,44 @@ async def test_monitor_timeout_publishes_partial_not_canonical(_finalize_env, tm
     assert (tmp_path / "response.partial.md").read_text() == rendered
 
 
+async def test_postsend_recovery_across_attempts_publishes_one_artifact(_finalize_env, tmp_path):
+    # Cross-ATTEMPT artifact uniqueness. The single-attempt tests above call
+    # _monitor_and_finalize once, and the _run_postsend tests below swap in
+    # _ScriptedMonitor, which never touches the filesystem — so nothing else
+    # covers the seam where attempt 1 stages a body, dies in the audit, and
+    # attempt 2 re-stages and publishes on a fresh tab. Exactly one artifact may
+    # survive: a leftover from attempt 1 alongside attempt 2's answer would put
+    # a stale body in the run_dir under a name a caller might read.
+    import asyncio
+    audits = {"n": 0}
+
+    async def _slug_closes_once(_page):
+        audits["n"] += 1
+        if audits["n"] == 1:
+            raise RunPageClosed()
+        return "gpt-5-6-pro"
+
+    async def _nav_ok(_ctx, _page, _url, *, deadline):
+        return None
+
+    _fake_turn(_finalize_env, text="the answer", copied="the answer (markdown)")
+    _finalize_env.setattr(cli, "served_assistant_model_slug", _slug_closes_once)
+    _finalize_env.setattr(cli, "_attach_response_logger", lambda _p, _n: None)
+    _finalize_env.setattr(cli, "_recover_navigate", _nav_ok)
+
+    conv = _ConversationUrl()
+    conv.capture("https://chatgpt.com/c/abc")
+    loop = asyncio.get_running_loop()
+    result, _page = await cli._run_postsend(
+        _FakeCtx(pages=[_FinalizePage()]), _FinalizePage(),
+        run_dir=tmp_path, run_id="r1", deadline=loop.time() + 100.0,
+        send_ts=loop.time(), conv=conv, network_log=[], err=_noop_err,
+    )
+    assert result["status"] == "ok"
+    assert audits["n"] == 2, "the audit must actually re-run on the recovered tab"
+    assert _artifacts(tmp_path) == {"response.md"}
+
+
 async def test_monitor_mismatch_outranks_timeout(_finalize_env, tmp_path):
     # A wrong model on an ungated turn is a model failure first: the fatal audit
     # runs regardless of `completed`, so this quarantines rather than publishing

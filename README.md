@@ -141,9 +141,11 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 - `prompt.md` — input
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
-- `response.md` — the answer, and **only** ever a verified, completed one (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
+- `response.md` — the answer: a completed turn the model audit did not reject. `result.json` reports `extraction: "copy_button"` or `"innertext"`, and `model_audit` — which is `verified` when the served model was confirmed, or a fail-open value (`unverified_missing_slug`, `model_ok_slug_missing`) when a selector break left the model unconfirmed and the run was allowed through anyway. Check it if provenance matters to you.
 - `result.json` — terminal status (atomic). **It is the authority: only `status: "ok"` makes `response.md` usable.**
-- `response.rejected.md` / `response.partial.md` / `response.pending.md` — the same extracted text under the name its outcome earned: the served model failed the audit, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. A run publishes exactly one of these four names, so the name tells you what you have without reading `result.json` first — but the text is no help: a wrong-model turn is complete and plausible, and a turn that missed the Copy-button gate can be fully rendered.
+- `response.rejected.md` / `response.partial.md` / `response.pending.md` — the extracted text under the name its outcome earned: the served model failed the audit, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. Don't judge by reading them — a wrong-model turn is complete and plausible, and a turn that missed the completion gate can be fully rendered.
+
+A run leaves **at most one** of those four names (a failure before extraction publishes none), so the name tells you what you have without opening `result.json`.
 - `conversation.json` — `{url, captured_at}`, the ChatGPT conversation this run submitted to. Diagnostic breadcrumb for manual recovery; written once the URL is known.
 - `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
 - `final.html` — last DOM snapshot

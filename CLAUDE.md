@@ -50,18 +50,21 @@ Load-bearing invariants (regression tests: `tests/test_page_recovery.py`):
 
 ## Atomic writes
 
-Use `atomic_write(path, content)` for `prompt.md`, `meta.json`, `response.md`, `result.json`. Pattern: write `path.tmp`, then `os.replace(tmp, path)` (POSIX atomic). `fetch` reads `result.json` concurrently with the worker writing it, so the rename guarantees a consistent read.
+Use `atomic_write(path, content)` for `prompt.md`, `meta.json`, `response.pending.md`, `result.json`. Pattern: write `path.tmp`, then `os.replace(tmp, path)` (POSIX atomic). `fetch` reads `result.json` concurrently with the worker writing it, so the rename guarantees a consistent read. (The answer body is `atomic_write`n to `response.pending.md` and reaches its final name via `publish_response` — never `atomic_write` it straight to `response.md`; see below.)
 
 ## Response artifact lifecycle — the name is the verdict
 
-**`response.md` means exactly one thing: a verified, completion-gated answer.** Extraction stages to `response.pending.md`; `publish_response(run_dir, name)` renames it once — and only once — the outcome is known:
+**`response.md` means exactly one thing: a completion-gated body the audit did not reject.** Note what that is *not* — it is **not** "model verified": the fail-open verdicts (`unverified_missing_slug`, `model_ok_slug_missing`) return `ok` by design and so publish canonically. `status: ok` + `model_audit` together are the guarantee; the filename alone only tells you the audit didn't *reject* it. Extraction stages to `response.pending.md`; `publish_response(run_dir, name)` renames it once — and only once — the outcome is known:
 
 | outcome | published name |
 |---|---|
 | `status: ok` (completed, audit not fatal — incl. the fail-opens) | `response.md` |
 | fatal model audit (`slug_mismatch` / `menu_mismatch`) | `response.rejected.md` |
 | `status: timeout` (never passed the Copy-button gate) | `response.partial.md` |
-| raised before any verdict (page close → `RunPageClosed`, `browser_disconnected_after_send`) | stays `response.pending.md` |
+| raised after staging, before any verdict (page close → `RunPageClosed`) | stays `response.pending.md` |
+| returned/raised **before** staging (`conversation_drift`, a pre-extraction close) | none — the run publishes nothing |
+
+So a run leaves **at most one** of these, not exactly one.
 
 This is structural, and it exists because **the text is not self-describing**: a wrong-model turn is complete and plausible, and a "partial" is not visibly partial — the Copy-button gate is exactly what catches a Pro thinking-summary that reads as a finished short answer (cf. `reframe-review-040`). So the *name* is the only signal a caller reading a run_dir gets, and every non-answer must carry a name that says so. Publishing late (rather than writing `response.md` up front and renaming on failure) is what closes the pre-verdict window: a crash between extraction and the audit would otherwise leave an **unaudited** answer at the canonical name. Staging keeps the diagnostic without ever claiming to be the answer — don't "simplify" this back to an eager write plus a rename.
 
