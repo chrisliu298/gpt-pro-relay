@@ -1582,11 +1582,20 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
 
     if model_audit in ("slug_mismatch", "menu_mismatch"):
         reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
+        # Quarantine the artifact, not just the run: a rejected turn's text is
+        # complete and plausible, differing from a verified answer only by
+        # provenance, so leaving it at `response.md` — the name every consumer
+        # treats as "the answer" — invites a caller to return it anyway.
+        # Renaming makes that require deliberately naming a rejected file. Only
+        # the two FATAL verdicts quarantine; the fail-open ones must keep
+        # response.md or a selector rename bricks the tool.
+        os.replace(run_dir / "response.md", run_dir / "response.rejected.md")
         await safe_screenshot(page, run_dir / f"error-{reason}.png")
         log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
         return err(reason,
                    {"served_slug": served_slug, "menu_model": menu_model,
-                    "completed": completed, "response_chars": len(response)})
+                    "completed": completed, "response_chars": len(response),
+                    "rejected_response": str(run_dir / "response.rejected.md")})
 
     if completed and model_audit != "verified":
         log_stage("served_model_unverified", model_audit=model_audit)
