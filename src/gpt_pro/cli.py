@@ -48,6 +48,16 @@ MAX_PAGE_RECOVERIES = 3
 # gate even *checks* for the no-Stop-button + Copy-button-present signals. Named
 # so tests can drive completion without waiting the wall-clock interval.
 COMPLETION_STABLE_SECS = 5.0
+# Bounded window in which the send must be confirmed to have actually landed
+# (URL -> /c/<id>, a user turn, or a Stop button). A silent no-op Send — the
+# click returned but ChatGPT never submitted (an attachment upload still
+# finalizing, a parallel-burst race) — leaves the composer full and the URL on
+# `/`, which is indistinguishable to the monitor loop from a Pro model thinking
+# silently, so the worker would otherwise burn the whole generation deadline on
+# a dead page (observed 2026-07-18: 2 of a 4-way burst no-op'd, ~60 min each).
+# Generous vs the ~2s real landing so a lagging URL capture never false-fails a
+# good send; still ~180x under the 60-min waste it replaces.
+SEND_LANDING_TIMEOUT = 20.0
 # The only URL shape recovery will reopen: a canonical ChatGPT conversation route.
 # Matched exactly (not a prefix) and stripped of query/fragment so a benign
 # ?model=... or #frag can't repoint recovery at a different conversation. A home
@@ -1496,6 +1506,56 @@ async def _stop_button_count(page) -> int:
         return 1
 
 
+async def _user_turn_present(page) -> bool:
+    """True once a user message turn has rendered — one positive signal that the
+    Send actually landed. Sentinel False on a live-page transient read (bias
+    toward 'not yet landed', which just keeps the gate polling); RunPageClosed on
+    a closed tab so the landing gate defers to recovery rather than false-report
+    not-landed."""
+    try:
+        return await page.locator('[data-message-author-role="user"]').count() > 0
+    except Exception:
+        if page.is_closed():
+            raise RunPageClosed()
+        return False
+
+
+async def _confirm_send_landed(page, conv, *, deadline: float, poll: float = 0.5) -> bool:
+    """After the Send click, confirm within a bounded window that the message
+    actually submitted. Any one of these proves it landed: a conversation URL was
+    captured (`/` -> `/c/<id>`), a user turn rendered, or generation started (a
+    Stop button). Returns False only if NONE appear before the window closes —
+    the silent-no-op-Send case the monitor loop cannot otherwise distinguish from
+    a Pro model thinking.
+
+    The cheap `conv.get()` fast path is checked first, and the cutoff BEFORE any
+    DOM read, so a preset conversation (a recovery re-entry) returns instantly and
+    an exhausted budget returns without touching the page or overrunning the
+    absolute `deadline`. `cutoff = min(now + SEND_LANDING_TIMEOUT, deadline)` and
+    the poll sleep is clamped to what remains, so the gate never grants a fresh
+    budget. Like the monitor loop's own `read_latest_assistant_text`, the DOM
+    probes are immediate `.count()` reads left unbounded — a wedged CDP session
+    self-corrects because the deadline is never reset. The signals are ORed and
+    bias toward 'landed' (a live-page Stop-read error yields the conservative
+    sentinel 1, which is treated as landed) — a false 'landed' only reverts to the
+    old monitor-then-timeout, whereas a false 'not-landed' would waste a fresh Pro
+    send. A tab close raises RunPageClosed via the read helpers; the URL path is
+    checked first so a close right after a captured URL still reports landed."""
+    loop = asyncio.get_running_loop()
+    cutoff = min(loop.time() + SEND_LANDING_TIMEOUT, deadline)
+    while True:
+        conv.capture(page.url)  # cheap non-awaiting backup poll (page.url is cached)
+        if conv.get():
+            return True
+        if loop.time() >= cutoff:
+            return False  # out of budget → skip DOM reads, never overrun deadline
+        if await _user_turn_present(page):
+            return True
+        if await _stop_button_count(page) > 0:
+            return True
+        await asyncio.sleep(min(poll, max(0.0, cutoff - loop.time())))
+
+
 async def _recover_navigate(ctx, page, conv_url: str, *, deadline: float) -> str | None:
     """Reopen the captured conversation on a replacement `page`. Returns None on
     success, or a failure-reason string:
@@ -1584,6 +1644,27 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
     overwritten atomically.
     """
     loop = asyncio.get_running_loop()
+
+    # Landing gate — the send may have been a silent no-op (the click returned
+    # but ChatGPT never submitted: an attachment upload still finalizing, a
+    # parallel-burst race). That leaves the composer full and the URL on `/`,
+    # which the monitor loop below cannot tell apart from a Pro model thinking
+    # silently, so it would spin to the full generation deadline on a dead page.
+    # Confirm the send landed within a bounded window; fail closed otherwise —
+    # NO resubmit (auto-retry is rejected: it burns 5-20 min of Pro reasoning),
+    # just surface the run_dir and let the caller decide. On a recovery re-entry
+    # `conv` is already set, so this returns instantly. A close here raises
+    # RunPageClosed from the read helpers → the _run_postsend recovery loop.
+    if not await _confirm_send_landed(page, conv, deadline=deadline):
+        await safe_screenshot(page, run_dir / "error-send_did_not_land.png")
+        try:
+            (run_dir / "error.html").write_text(await page.content())
+        except Exception:
+            if page.is_closed():
+                raise RunPageClosed()
+        log_stage("error", reason="send_did_not_land", conversation_url=conv.get())
+        return err("send_did_not_land", {"conversation_url": conv.get()})
+
     last_text = ""
     last_change = loop.time()
     snapshot_idx = 0

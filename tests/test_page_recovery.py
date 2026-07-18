@@ -23,6 +23,7 @@ from gpt_pro import cli
 from gpt_pro.cli import (
     RunPageClosed,
     _ConversationUrl,
+    _confirm_send_landed,
     _monitor_and_finalize,
     _recover_navigate,
     _stop_button_count,
@@ -659,6 +660,257 @@ async def test_monitor_mismatch_outranks_timeout(_finalize_env, tmp_path):
     result = await _finalize(tmp_path, budget=0.25)
     assert result["reason"] == "served_model_mismatch"
     assert _artifacts(tmp_path) == {"response.rejected.md"}
+
+
+# ---- _confirm_send_landed (post-send landing gate) ----
+
+class _LandingPage:
+    """Minimal page for the landing gate: exposes `url` + `is_closed`. The two
+    DOM signals (_user_turn_present / _stop_button_count) are monkeypatched, so
+    no locator fake is needed."""
+    def __init__(self, url="https://chatgpt.com/", closed=False):
+        self._url = url
+        self._closed = closed
+
+    @property
+    def url(self):
+        return self._url
+
+    def is_closed(self):
+        return self._closed
+
+
+@pytest.fixture
+def _landing_env(monkeypatch):
+    # Default: no user turn, no Stop button, zero-length window so a no-signal
+    # gate falls straight through to the out-of-budget return without a
+    # wall-clock wait. Tests that exercise the DOM probes / polling raise the
+    # window (a positive SEND_LANDING_TIMEOUT).
+    async def _no_user(_page):
+        return False
+
+    async def _no_stop(_page):
+        return 0
+
+    monkeypatch.setattr(cli, "_user_turn_present", _no_user)
+    monkeypatch.setattr(cli, "_stop_button_count", _no_stop)
+    monkeypatch.setattr(cli, "SEND_LANDING_TIMEOUT", 0.0)
+    return monkeypatch
+
+
+async def test_send_landed_via_url(_landing_env):
+    import asyncio
+    page = _LandingPage(url="https://chatgpt.com/c/abc")
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    assert await _confirm_send_landed(page, conv, deadline=loop.time() + 100.0) is True
+    assert conv.get() == "https://chatgpt.com/c/abc"
+
+
+async def test_send_not_landed_when_no_signal(_landing_env):
+    # Zero-window (out-of-budget) case: composer full, URL still `/`, no user
+    # turn / Stop → not landed. The DOM-checked-then-timed-out path is covered by
+    # test_send_landing_sleep_clamped_to_budget below.
+    import asyncio
+    page = _LandingPage(url="https://chatgpt.com/")
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    assert await _confirm_send_landed(page, conv, deadline=loop.time() + 100.0) is False
+
+
+async def test_send_landed_via_user_turn(_landing_env):
+    # A rendered user turn proves landing even before the URL flips to /c/. Needs
+    # a positive window: the cutoff is checked before the DOM probes.
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 5.0)
+
+    async def _yes_user(_page):
+        return True
+
+    _landing_env.setattr(cli, "_user_turn_present", _yes_user)
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    assert await _confirm_send_landed(_LandingPage(), conv, deadline=loop.time() + 100.0) is True
+
+
+async def test_send_landed_via_stop_button(_landing_env):
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 5.0)
+
+    async def _stop(_page):
+        return 1
+
+    _landing_env.setattr(cli, "_stop_button_count", _stop)
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    assert await _confirm_send_landed(_LandingPage(), conv, deadline=loop.time() + 100.0) is True
+
+
+async def test_send_landed_via_delayed_signal(_landing_env):
+    # The polling path: the signal is absent on the first probe and appears on a
+    # later one. Proves the gate keeps polling within budget rather than
+    # one-shotting. (asyncio.sleep is the autouse no-op, so no wall-clock wait.)
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 100.0)
+    calls = {"n": 0}
+
+    async def _user_delayed(_page):
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    _landing_env.setattr(cli, "_user_turn_present", _user_delayed)
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    assert await _confirm_send_landed(_LandingPage(), conv, deadline=loop.time() + 100.0) is True
+    assert calls["n"] >= 2
+
+
+async def test_send_not_landed_past_deadline_skips_dom(_landing_env):
+    # An already-past deadline must return False WITHOUT touching the page — the
+    # cutoff is checked before any DOM read so a spent budget never overruns.
+    import asyncio
+
+    async def _boom(_page):
+        raise AssertionError("no DOM read when the budget is already spent")
+
+    _landing_env.setattr(cli, "_user_turn_present", _boom)
+    _landing_env.setattr(cli, "_stop_button_count", _boom)
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 100.0)
+    conv = _ConversationUrl()  # empty: no URL captured
+    past = asyncio.get_running_loop().time() - 1.0
+    assert await _confirm_send_landed(_LandingPage(url="https://chatgpt.com/"),
+                                      conv, deadline=past) is False
+
+
+async def test_send_landing_sleep_clamped_to_budget(_landing_env):
+    # A remaining budget shorter than `poll` must clamp the sleep so the gate
+    # returns at the cutoff, never a full `poll` past it. Pre-fix this slept the
+    # whole 0.5s poll regardless of the 0.05s budget. Records every sleep
+    # argument and asserts none exceeds the window.
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 0.05)
+    slept = []
+
+    async def _rec(d):  # overrides the autouse no-op; records the clamp arg
+        slept.append(d)
+        return None
+
+    _landing_env.setattr(cli.asyncio, "sleep", _rec)
+    probes = {"n": 0}
+
+    async def _count(_page):
+        probes["n"] += 1
+        return False
+
+    _landing_env.setattr(cli, "_user_turn_present", _count)
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    result = await _confirm_send_landed(_LandingPage(), conv,
+                                        deadline=loop.time() + 100.0, poll=0.5)
+    assert result is False
+    assert probes["n"] >= 1            # the DOM was actually probed before timeout
+    assert slept and max(slept) <= 0.05  # never slept a full 0.5 poll past cutoff
+
+
+async def test_send_landing_noop_on_preset_conv(_landing_env):
+    # Recovery re-entry: conv already captured → instant True, and the DOM
+    # signals are never even read (so a closed page can't raise here).
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 100.0)
+
+    async def _boom(_page):
+        raise AssertionError("must not read DOM once conv is set")
+
+    _landing_env.setattr(cli, "_user_turn_present", _boom)
+    _landing_env.setattr(cli, "_stop_button_count", _boom)
+    conv = _ConversationUrl()
+    conv.capture("https://chatgpt.com/c/abc")
+    loop = asyncio.get_running_loop()
+    page = _LandingPage(url="https://chatgpt.com/", closed=True)
+    assert await _confirm_send_landed(page, conv, deadline=loop.time() + 100.0) is True
+
+
+async def test_send_landing_close_raises_run_page_closed(_landing_env):
+    # A tab close during the gate (before any URL was captured) must raise so the
+    # recovery loop handles it — never silently report not-landed.
+    import asyncio
+    _landing_env.setattr(cli, "SEND_LANDING_TIMEOUT", 100.0)
+
+    async def _closed(_page):
+        raise RunPageClosed()
+
+    _landing_env.setattr(cli, "_user_turn_present", _closed)
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    with pytest.raises(RunPageClosed):
+        await _confirm_send_landed(_LandingPage(), conv, deadline=loop.time() + 100.0)
+
+
+class _LocatorPage:
+    """Page whose `.locator(...).count()` is scriptable — drives the real
+    `_user_turn_present` (rather than a monkeypatched stand-in) through its
+    sentinel/close branches."""
+    def __init__(self, *, count=0, raises=False, closed=False):
+        self._count = count
+        self._raises = raises
+        self._closed = closed
+
+    def is_closed(self):
+        return self._closed
+
+    def locator(self, _selector):
+        page = self
+
+        class _Loc:
+            async def count(self):
+                if page._raises:
+                    raise RuntimeError("transient locator failure")
+                return page._count
+
+        return _Loc()
+
+
+async def test_user_turn_present_reports_count():
+    assert await cli._user_turn_present(_LocatorPage(count=1)) is True
+    assert await cli._user_turn_present(_LocatorPage(count=0)) is False
+
+
+async def test_user_turn_present_live_transient_returns_false():
+    # A read failure on a still-live page is a sentinel False (keeps the gate
+    # polling), never a raise.
+    assert await cli._user_turn_present(_LocatorPage(raises=True, closed=False)) is False
+
+
+async def test_user_turn_present_closed_raises_run_page_closed():
+    with pytest.raises(RunPageClosed):
+        await cli._user_turn_present(_LocatorPage(raises=True, closed=True))
+
+
+async def test_monitor_fails_closed_on_send_not_landed(_finalize_env, tmp_path):
+    # End-to-end through the monitor: a no-op Send fails closed FAST as
+    # send_did_not_land instead of spinning to the generation deadline, and
+    # publishes NO answer artifact (it returns before any staging).
+    import asyncio
+
+    async def _no_user(_page):
+        return False
+
+    async def _no_stop(_page):
+        return 0
+
+    _finalize_env.setattr(cli, "_user_turn_present", _no_user)
+    _finalize_env.setattr(cli, "_stop_button_count", _no_stop)
+    _finalize_env.setattr(cli, "SEND_LANDING_TIMEOUT", 0.0)
+    page = _FinalizePage(url="https://chatgpt.com/")  # never left the landing page
+    conv = _ConversationUrl()
+    loop = asyncio.get_running_loop()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=loop.time() + 100.0, send_ts=loop.time(),
+        conv=conv, err=_noop_err,
+    )
+    assert result["reason"] == "send_did_not_land"
+    assert _artifacts(tmp_path) == set()
 
 
 # ---- _run_postsend recovery-loop control flow ----
