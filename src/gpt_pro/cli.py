@@ -22,6 +22,12 @@ CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
+# "Too many requests" conversation-history rate-limit modal (data-testid). A
+# parallel burst throttles the sidebar list endpoint (/backend-api/conversations
+# → 429) and ChatGPT renders this full-viewport modal; auto-dismissed so its
+# pointer-events backdrop never hangs a composer/send click. See
+# _install_rate_limit_dismisser.
+RATE_LIMIT_MODAL_TESTID = "modal-conversation-history-rate-limit"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
@@ -415,6 +421,13 @@ def atomic_write(path: Path, content: str) -> None:
 # only once the run's outcome is known (see `publish_response`).
 RESPONSE_STAGED = "response.pending.md"
 
+# Graceful-stop signal. `stop <run-id>` writes this file into the run_dir; the
+# owning worker polls it at its phase gates (queued wait → dequeue; pre-send →
+# abort before the irreversible click; post-send monitor → click ChatGPT's Stop
+# button). File existence IS the signal — never a control channel, no server, no
+# new lock. Only the claim-holding worker acts on it, so single-writer holds.
+STOP_REQUEST = "stop.request"
+
 
 def publish_response(run_dir: Path, final_name: str) -> None:
     """Rename the staged extraction to the name its outcome earns.
@@ -429,6 +442,109 @@ def publish_response(run_dir: Path, final_name: str) -> None:
     claiming to be the answer.
     """
     os.replace(run_dir / RESPONSE_STAGED, run_dir / final_name)
+
+
+# Statuses that make result.json terminal (written exactly once, at run end).
+_TERMINAL_STATUSES = frozenset({"ok", "error", "timeout", "stopped"})
+
+
+def stop_requested(run_dir: Path) -> bool:
+    """True once `stop <run-id>` has written the stop signal for this run.
+
+    Checked at the worker's phase gates. Existence is the whole signal (content
+    is advisory), so this is a cheap stat the polling loops can call every
+    iteration. Fail-safe by construction: a missing/unreadable run_dir reads as
+    "no stop", never an error that would abort a healthy run.
+    """
+    return (run_dir / STOP_REQUEST).exists()
+
+
+def write_stop_signal(run_dir: Path) -> None:
+    """Create the stop signal idempotently and concurrency-safely.
+
+    Existence IS the signal, so two `stop` callers racing on the same run must
+    both succeed. `atomic_write` is the WRONG tool here — it is the single-writer
+    helper and its fixed `<path>.tmp` name collides under concurrent producers
+    (one's `os.replace` then fails FileNotFoundError). O_CREAT|O_EXCL makes the
+    first writer create+stamp the file and every loser no-op on FileExistsError.
+    Content (a timestamp) is advisory diagnostics; the worker only ever stats it.
+    """
+    try:
+        fd = os.open(run_dir / STOP_REQUEST, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return
+    try:
+        os.write(fd, json.dumps({"requested_at": time.time()}).encode())
+    finally:
+        os.close(fd)
+
+
+def clear_stop_signal(run_dir: Path) -> None:
+    """Remove the stop signal (best-effort). Called on every terminal-result path
+    of `stop` so a now-inert signal never lingers to be re-observed by a hand-run
+    `_run` (the terminal-rerun guard already refuses such a run, but a clean
+    run_dir is one less trap)."""
+    try:
+        (run_dir / STOP_REQUEST).unlink()
+    except OSError:
+        pass
+
+
+def _worker_process_alive(run_id: str) -> bool:
+    """True if a `_run <run_id>` worker process exists (non-contending liveness).
+
+    Used by `stop` ONLY to distinguish a dead worker from a slow one. It must NOT
+    contend on the run's `RunClaim`: the worker acquires that claim once,
+    non-blocking, and reads a failed acquire as "another worker owns this run"
+    and exits — so a reader that transiently held the claim as a probe could make
+    a just-starting worker abort and orphan the run. A read-only process check
+    can never do that. Best-effort: on any error (no `pgrep`, timeout) assume
+    alive, so we never falsely report a live worker dead.
+    """
+    # pgrep -f matches an ERE against the whole cmdline, so the pattern MUST be
+    # escaped and boundary-anchored: an unescaped `gpt_pro.cli _run r1` lets `.`
+    # act as a wildcard AND matches a *different* worker whose id merely starts
+    # with `r1` (`r10`, `r1-x`) — which would report a dead target `pending`
+    # forever. The worker id is the LAST argv, so anchor on a following space or
+    # end of line.
+    pattern = r"gpt_pro\.cli _run " + re.escape(run_id) + r"([[:space:]]|$)"
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        return True
+    # pgrep exit codes: 0 matched, 1 NO match, 2/3 operational error (bad
+    # pattern / internal). Only 1 proves absence — treat every other nonzero as
+    # indeterminate and fail-safe to "alive", so a pgrep error can never falsely
+    # report a live worker dead (→ a spurious no_live_worker).
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
+        return False
+    return True
+
+
+class RunStopped(Exception):
+    """Raised out of the pre-send path (the ParallelSlot queue wait) when a stop
+    signal is seen while the run is still queued — dequeue without ever sending.
+    Post-send stops are NOT this: the monitor loop handles them in place by
+    clicking Stop, because by then a conversation exists to halt."""
+
+
+def _stopped_result(run_id: str, run_dir: Path, reason: str) -> dict:
+    """Terminal result for a run halted by a stop signal. Per the discard policy
+    no response artifact is published — `result.json` (status `stopped`) is the
+    authority, and `reason` records the phase: `stopped_before_send` (dequeued,
+    no Pro reasoning spent) or `stopped_after_send` (Stop clicked mid-turn)."""
+    return {
+        "status": "stopped",
+        "reason": reason,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "exit_code": 5,
+    }
 
 
 class RunPageClosed(Exception):
@@ -967,6 +1083,8 @@ def _emit_terminal(result: dict, run_dir: Path, output_path: Path | None = None)
         return 0
     if status == "timeout":
         return 3
+    if status == "stopped":
+        return 5  # halted by `stop`; no response artifact (discard policy)
     return 1
 
 
@@ -1093,6 +1211,90 @@ async def cmd_fetch(args) -> int:
     return _emit_terminal(result, run_dir, output_path=args.output)
 
 
+# ---- stop ----
+
+async def cmd_stop(args) -> int:
+    """Interrupt a run by id. Writes the `stop.request` signal; the owning worker
+    consumes it at its next phase gate — dequeue if not yet sent, else click
+    ChatGPT's Stop button on the live turn. This command NEVER drives the browser
+    itself (worker-only v1); it only produces the signal and reports the outcome.
+
+    Exit codes: 0 stopped / already-finished / accepted-but-pending; 2 no live
+    worker consumed it (server-side generation may continue → manual CDP path);
+    4 unknown run.
+    """
+    validate_run_id(args.run_id)
+    run_dir = RUNS / args.run_id
+    result_path = run_dir / "result.json"
+    if not run_dir.exists() or not (run_dir / "meta.json").exists():
+        stderr_jsonl({"status": "not_found", "run_id": args.run_id,
+                      "hint": "No such run_dir; nothing to stop."})
+        return 4
+
+    # Already terminal → nothing to stop.
+    def _terminal_now():
+        if not result_path.exists():
+            return None
+        try:
+            return json.loads(result_path.read_text())
+        except json.JSONDecodeError:
+            return None  # mid-write; treat as not-yet-terminal
+
+    existing = _terminal_now()
+    if existing is not None:
+        clear_stop_signal(run_dir)  # clear any stale signal on an already-done run
+        stderr_jsonl({"status": "already_finished", "run_id": args.run_id,
+                      "final_status": existing.get("status"), "run_dir": str(run_dir)})
+        return 0
+
+    # Produce the signal race-free (existence IS the signal; concurrent stoppers
+    # must both succeed — see write_stop_signal, which avoids atomic_write's
+    # single-writer `.tmp` collision).
+    write_stop_signal(run_dir)
+    stderr_jsonl({"status": "stop_requested", "run_id": args.run_id, "run_dir": str(run_dir)})
+
+    # Wait (bounded) for the owning worker to consume the signal and finalize.
+    # We do NOT probe the run's RunClaim to test liveness: the worker acquires
+    # that claim once, non-blocking, and treats a failed acquire as "another
+    # worker owns this" and exits — so transiently holding it here could make a
+    # just-starting worker abort and orphan the run. Liveness is checked ONLY
+    # after this wait, via a read-only process check that can't touch the claim.
+    result = await _wait_for_result(run_dir, timeout=args.timeout)
+    if result is not None:
+        # Terminal reached (the worker consumed the stop, or finished first).
+        # Clean up our now-inert signal so it can't linger in the run_dir.
+        clear_stop_signal(run_dir)
+        status = result.get("status")
+        if status == "stopped":
+            stderr_jsonl({"status": "stopped", "reason": result.get("reason"),
+                          "run_id": args.run_id, "run_dir": str(run_dir)})
+        else:
+            stderr_jsonl({"status": "already_finished", "final_status": status,
+                          "run_id": args.run_id, "run_dir": str(run_dir),
+                          "note": "Run reached a terminal result before the stop landed."})
+        return 0
+
+    # No terminal result within the window. Distinguish a slow worker from a dead
+    # one with a non-contending process check (never the claim). A live worker →
+    # pending (it will consume the signal). No worker process → recheck the result
+    # once (finish race), else report the orphan.
+    if _worker_process_alive(args.run_id):
+        stderr_jsonl({"status": "pending", "run_id": args.run_id, "run_dir": str(run_dir),
+                      "note": "Worker is alive and will consume the stop; poll `fetch` to confirm "
+                              "or re-run `stop` with a larger --timeout."})
+        return 0
+    existing = _terminal_now()
+    if existing is not None:
+        clear_stop_signal(run_dir)  # finish-race: the worker completed; clear the inert signal
+        stderr_jsonl({"status": "already_finished", "final_status": existing.get("status"),
+                      "run_id": args.run_id, "run_dir": str(run_dir)})
+        return 0
+    stderr_jsonl({"status": "no_live_worker", "run_id": args.run_id, "run_dir": str(run_dir),
+                  "note": "No live worker consumed the stop; server-side generation may "
+                          "continue. Use the manual CDP stop path if needed."})
+    return 2
+
+
 # ---- _run: detached worker driving Chrome ----
 
 async def _log_response(resp, log: list) -> None:
@@ -1111,7 +1313,7 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
     worker that calls `bring_to_front()` mid-keystroke would redirect this
     paste to its own composer. We also wait for ProseMirror to actually ingest
     the paste (composer text length reaches a sentinel) before releasing the
-    lock — `keyboard.press("Meta+V")` returns when the CDP event is dispatched,
+    lock — `composer.press("Meta+V")` returns when the CDP event is dispatched,
     not when the paste handler has finished. Without the wait, the next worker
     can pbcopy something else while ProseMirror is still consuming our paste.
 
@@ -1130,7 +1332,16 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
         try:
             await composer.click()
             subprocess.run(["pbcopy"], input=prompt_text, text=True, check=True, timeout=10)
-            await page.keyboard.press("Meta+V")
+            # Locator-bound paste (composer.press), NOT page.keyboard.press. The
+            # rate-limit modal can mount in the gap between composer.click() and
+            # this line (a conversation-list fetch 429s during the synchronous
+            # pbcopy) and steal focus — a bare keyboard.press has no actionability
+            # checkpoint, so it would dispatch Meta+V into the modal and lose the
+            # paste. composer.press re-runs the _install_rate_limit_dismisser
+            # handler checkpoint (dismissing any modal) and re-focuses the
+            # composer immediately before dispatching the same Meta+V key event
+            # that hits ProseMirror's optimized native-paste handler.
+            await composer.press("Meta+V")
             # Wait until the send button mounts before releasing the lock. The
             # send button is only mounted when the composer has non-empty
             # content — its presence proves ProseMirror's paste handler ran
@@ -1372,9 +1583,15 @@ class ParallelSlot:
     `slot_id` is public: the worker passes it to `ensure_shared_chrome_running`
     so a wedged-Chrome recovery can skip its own slot (see `_slots_held`). It is
     None before acquisition and after release.
+
+    `stop_check` (optional) is polled each wait iteration; if it returns True the
+    run was stopped while still queued, so `__enter__` raises `RunStopped` to
+    dequeue — no slot is ever acquired (checked before the acquire attempt, so
+    `_fd` stays None and there is nothing to release).
     """
-    def __init__(self, max_parallel: int):
+    def __init__(self, max_parallel: int, *, stop_check=None):
         self.max_parallel = max_parallel
+        self._stop_check = stop_check
         self._fd = None
         self.slot_id = None
 
@@ -1383,6 +1600,8 @@ class ParallelSlot:
         wait_start = time.time()
         queued_logged = False
         while True:
+            if self._stop_check is not None and self._stop_check():
+                raise RunStopped()
             for slot_id in range(self.max_parallel):
                 fd = open(SLOT_LOCK_DIR / f"slot-{slot_id}.lock", "w")
                 try:
@@ -1434,10 +1653,20 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         return d
 
     log_stage("start", run_id=run_id)
-    with ParallelSlot(get_max_parallel()) as slot:
-        # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
-        # the worker counts its own held slot and never recovers (see _slots_held).
-        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot.slot_id)
+    # A stop that arrived before we even started (or while queued for a slot)
+    # dequeues with no Pro reasoning spent. The pre-slot check covers "requested
+    # before start"; ParallelSlot's stop_check covers "requested while queued".
+    if stop_requested(run_dir):
+        log_stage("stopped", reason="stopped_before_send", phase="pre_slot")
+        return _stopped_result(run_id, run_dir, "stopped_before_send")
+    try:
+        with ParallelSlot(get_max_parallel(), stop_check=lambda: stop_requested(run_dir)) as slot:
+            # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
+            # the worker counts its own held slot and never recovers (see _slots_held).
+            return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot.slot_id)
+    except RunStopped:
+        log_stage("stopped", reason="stopped_before_send", phase="queued")
+        return _stopped_result(run_id, run_dir, "stopped_before_send")
 
 
 async def _goto_with_retry(
@@ -1474,6 +1703,55 @@ def _attach_response_logger(page, network_log: list) -> None:
     page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
 
 
+async def _install_rate_limit_dismisser(page) -> None:
+    """Auto-dismiss the "Too many requests" conversation-history rate-limit modal.
+
+    During a parallel burst ChatGPT throttles the sidebar conversation-list
+    endpoint (`/backend-api/conversations` → 429) and renders a full-viewport
+    `fixed inset-0 z-50` modal (`data-testid=RATE_LIMIT_MODAL_TESTID`, dismiss
+    button "Got it"). It is NOT a generation/usage cap — the Pro model keeps
+    answering underneath (13 of 15 observed runs still finished `ok`) — but its
+    `pointer-events: auto` backdrop makes the composer un-clickable, so a worker
+    that reaches `composer.click()` while it is up hangs the full 30s
+    actionability timeout and dies `worker_exception` (2026-07-19, 2 runs), and
+    it steals focus from a human on the shared Chrome.
+
+    Registered as a Playwright locator handler so it fires automatically before
+    the actionability checks of every subsequent click (chip-menu, composer,
+    send, Copy) and clears the overlay with no polling. Playwright verifies the
+    modal is hidden after the handler, so a click that fails to dismiss surfaces
+    as the triggering action's own timeout rather than silently looping. Safe
+    w.r.t. `_focus_and_paste`: the handler runs *inside* `composer.click()`'s
+    actionability wait, and that click then (re)focuses the composer before
+    `Meta+V`, so the paste still lands in the composer.
+
+    This is a UI-overlay cleaner, NOT rate-limit backoff — it never resubmits or
+    re-spends Pro reasoning. Two distinct failure modes, both non-fatal by
+    design (fail-open, matching the repo's fail-open-on-drift philosophy — an
+    unprotected run is exactly the pre-fix baseline that succeeds ~99% of the
+    time, so degrading to it beats bricking the send path):
+      - A **selector rename** (`RATE_LIMIT_MODAL_TESTID` no longer matches) does
+        NOT raise here — Playwright locators are lazy, so registration succeeds
+        and the handler simply never fires (inert). The modal, if it appears,
+        again stalls the composer click as it did pre-fix; `doctor`/`error.html`
+        remain the way that surfaces.
+      - A genuine `add_locator_handler` API/channel failure (unhealthy CDP, an
+        incompatible Playwright) IS what the try/except catches — swallowed to
+        `rate_limit_dismisser_install_skipped` so a Playwright API change can't
+        brick the send path. The cause-side lever for the throttle itself is
+        lowering GPT_PRO_MAX_PARALLEL.
+    """
+    async def _dismiss() -> None:
+        modal = page.get_by_test_id(RATE_LIMIT_MODAL_TESTID)
+        await modal.get_by_role("button", name="Got it").click(timeout=5000)
+        log_stage("rate_limit_modal_dismissed")
+
+    try:
+        await page.add_locator_handler(page.get_by_test_id(RATE_LIMIT_MODAL_TESTID), _dismiss)
+    except Exception as e:
+        log_stage("rate_limit_dismisser_install_skipped", exception=f"{type(e).__name__}: {e}")
+
+
 async def read_latest_assistant_text(page) -> str:
     """Latest assistant turn's innerText, or "" on a *live-page* transient read
     failure. Raises RunPageClosed if the tab was closed — so the monitor loop
@@ -1504,6 +1782,24 @@ async def _stop_button_count(page) -> int:
         if page.is_closed():
             raise RunPageClosed()
         return 1
+
+
+async def _click_stop_button(page) -> bool:
+    """Click ChatGPT's Stop-generating control to halt the in-flight turn. Same
+    selector `_stop_button_count` reads. Returns True if a Stop button was found
+    and clicked, False if none was present (the turn may have just finished —
+    harmless). Raises RunPageClosed on a closed tab so a close during a stop
+    routes to the monitor's recovery loop rather than being laundered to False."""
+    try:
+        loc = page.locator('button[aria-label*="Stop"], [data-testid*="stop"]')
+        if await loc.count() == 0:
+            return False
+        await loc.first.click(timeout=5000)
+        return True
+    except Exception:
+        if page.is_closed():
+            raise RunPageClosed()
+        return False
 
 
 async def _user_turn_present(page) -> bool:
@@ -1670,12 +1966,64 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
     snapshot_idx = 0
     next_snap = loop.time() + 5.0
     completed = False
+    stop_pending_logged = False
     while loop.time() < deadline:
         now = loop.time()
         # Backup URL capture (covers a missed framenavigated event) + one-time
         # persist. Idempotent and immutable once set.
         conv.capture(page.url)
         conv.persist(run_dir)
+        # Post-send stop: the message is in flight, so we cannot dequeue — click
+        # ChatGPT's Stop control to halt the turn, then finalize as `stopped`.
+        # Checked once per ~1.5s iteration.
+        if stop_requested(run_dir):
+            # (1) Never act on a conversation we don't own. If the recovered tab
+            # drifted to a different /c/<id> (a human grabbed it), clicking Stop
+            # would halt an UNOWNED conversation. Same guard as the post-loop
+            # drift check, applied BEFORE this outward action (which the discard
+            # policy does not excuse).
+            captured = conv.get()
+            if captured and parse_conversation_url(page.url) != captured:
+                await safe_screenshot(page, run_dir / "error-conversation_drift.png")
+                log_stage("error", reason="conversation_drift", expected=captured, actual=page.url)
+                return err("conversation_drift", {"expected": captured, "actual": page.url})
+            # (2) Only finalize `stopped` on a POSITIVE click. A missing/failed
+            # Stop button is NOT proof the turn halted — the Pro thinking-summary
+            # phase renders no Stop button while reasoning silently continues, so
+            # claiming `stopped` there would report success while quota keeps
+            # burning. On a non-click, fall through and retry next iteration: the
+            # turn either becomes stoppable again or completes normally (→ ok).
+            if await _click_stop_button(page):
+                # Positive stop CONFIRMED. Everything below is best-effort and must
+                # NOT raise into the recovery loop: a tab close during these
+                # diagnostics would otherwise lose the confirmed stop, and the
+                # reopened turn (Stop button now absent *because* we halted it)
+                # could fall through and republish the partial as `ok`. So we
+                # return `stopped` regardless of a later close. (An ambiguous close
+                # DURING the click raises RunPageClosed from _click_stop_button
+                # itself → recovery — correct, since there was no confirmation.)
+                # Discard policy: drop any partial staged by a prior attempt.
+                # Best-effort like the rest of this post-confirmation block — a
+                # non-FileNotFoundError unlink failure (e.g. a permission/I-O
+                # error) must NOT escape and lose the confirmed stop.
+                try:
+                    (run_dir / RESPONSE_STAGED).unlink()
+                except OSError:
+                    pass
+                try:
+                    await safe_screenshot(page, run_dir / "stopped.png")
+                except Exception:
+                    pass
+                try:
+                    (run_dir / "final.html").write_text(await page.content())
+                except Exception:
+                    pass
+                log_stage("stopped", reason="stopped_after_send",
+                          chars=len(last_text), elapsed_secs=round(loop.time() - send_ts, 1))
+                return _stopped_result(run_id, run_dir, "stopped_after_send")
+            if not stop_pending_logged:
+                log_stage("stop_pending", reason="stop_button_absent")
+                stop_pending_logged = True
         if now >= next_snap:
             await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
             snapshot_idx += 1
@@ -1835,6 +2183,7 @@ async def _run_postsend(ctx, page, *, run_dir, run_id, deadline, send_ts, conv, 
                               exception=f"{type(e).__name__}: {e}")
                     return err("browser_disconnected_after_send", {"conversation_url": conv_url}), page
                 _attach_response_logger(page, network_log)
+                await _install_rate_limit_dismisser(page)
                 nav_reason = await _recover_navigate(ctx, page, conv_url, deadline=deadline)
                 if nav_reason == "closed":
                     # Reopened tab closed during nav — re-classify (inner loop),
@@ -1873,7 +2222,20 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
             # background tabs in a windowed Chrome.
             try:
                 _attach_response_logger(page, network_log)
+                # Register before goto so the "Too many requests" modal is
+                # auto-dismissed ahead of every downstream click (chip-menu,
+                # composer, send, Copy) — the burst throttle can render it as
+                # early as the first conversation-list fetch on page load.
+                await _install_rate_limit_dismisser(page)
                 log_stage("chrome_connected")
+
+                # Early dequeue: a stop that arrived while queued (or during the
+                # brief connect) aborts before we spend the navigation/login/paste
+                # path. The pre-send gate below is the authoritative no-quota
+                # boundary; this is just an optimization to bail sooner.
+                if stop_requested(run_dir):
+                    log_stage("stopped", reason="stopped_before_send", phase="pre_nav")
+                    return _stopped_result(run_id, run_dir, "stopped_before_send")
 
                 await _goto_with_retry(page, "https://chatgpt.com/")
                 await pin_viewport_cdp(ctx, page)
@@ -1983,6 +2345,16 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 loop = asyncio.get_running_loop()
                 send_ts = loop.time()
                 deadline = send_ts + DEFAULT_GENERATION_TIMEOUT
+                # Dequeue-before-send: the LAST pre-send gate, placed immediately
+                # before the single irreversible click (after all observer/locator
+                # setup) so the only window a stop can miss both this and the
+                # post-send monitor path is the click dispatch itself. That window
+                # is safe: a stop landing during the click just stops the sent turn
+                # mid-flight instead of dequeuing — never a double-send. Aborting
+                # here spends NO Pro reasoning.
+                if stop_requested(run_dir):
+                    log_stage("stopped", reason="stopped_before_send", phase="pre_send")
+                    return _stopped_result(run_id, run_dir, "stopped_before_send")
                 try:
                     await send_btn.click()
                 except Exception as e:
@@ -2074,6 +2446,34 @@ async def cmd_run(args) -> int:
 
 async def _run_claimed(run_id: str, run_dir: Path) -> int:
     """The worker body, holding this run's `RunClaim`."""
+    # Never rerun a run that already reached a terminal result — checked FIRST,
+    # before any validation that could write. A hand-run `_run` (or any respawn)
+    # on a finished run_dir would otherwise RE-SEND the prompt and overwrite the
+    # authoritative result.json — e.g. a stale `stop.request` left after an `ok`
+    # completion clobbering it to `stopped` (and orphaning the published
+    # `response.md`). result.json is written exactly once, at run end, so its
+    # presence with a terminal status means the run is done: exit with its
+    # recorded code and touch NOTHING (in particular, do not let the missing-
+    # prompt path below overwrite a terminal result with `missing_prompt`).
+    # Idempotent `ask` attach never reaches here — it reads result.json directly
+    # and does not respawn.
+    result_path = run_dir / "result.json"
+    if result_path.exists():
+        try:
+            existing = json.loads(result_path.read_text())
+        except json.JSONDecodeError:
+            existing = None
+        if existing is not None and existing.get("status") in _TERMINAL_STATUSES:
+            stderr_jsonl({
+                "status": "error",
+                "reason": "already_terminal",
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "final_status": existing.get("status"),
+                "hint": "This run already finished; refusing to rerun (would re-send / clobber result.json).",
+            })
+            return existing.get("exit_code", 0)
+
     prompt_path = run_dir / "prompt.md"
     if not run_dir.exists() or not prompt_path.exists():
         result = {
@@ -2143,6 +2543,11 @@ def main() -> int:
     fetch_p.add_argument("--output", type=Path, default=None,
                         help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged.")
 
+    stop_p = sub.add_parser("stop", help="Interrupt a run by id: dequeue if not yet sent, else click Stop on the live turn.")
+    stop_p.add_argument("run_id")
+    stop_p.add_argument("--timeout", type=float, default=30.0,
+                        help="Max seconds to wait for the owning worker to finalize the stop (default 30).")
+
     run_p = sub.add_parser("_run", help=argparse.SUPPRESS)
     run_p.add_argument("run_id")
 
@@ -2155,6 +2560,8 @@ def main() -> int:
         return asyncio.run(cmd_ask(args))
     if args.cmd == "fetch":
         return asyncio.run(cmd_fetch(args))
+    if args.cmd == "stop":
+        return asyncio.run(cmd_stop(args))
     if args.cmd == "_run":
         return asyncio.run(cmd_run(args))
     if args.cmd == "close-chrome":

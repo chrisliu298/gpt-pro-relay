@@ -417,6 +417,172 @@ async def test_monitor_completes_and_audits(_finalize_env, tmp_path):
     assert (tmp_path / "response.md").read_text() == "the answer (markdown)"
 
 
+async def test_monitor_stops_after_send_on_signal(_finalize_env, tmp_path):
+    # A stop.request seen post-send halts the turn: the monitor clicks Stop and
+    # finalizes `stopped_after_send`. Per the discard policy nothing is extracted
+    # or published — no response.md.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+    clicked = []
+
+    async def _click(_page):
+        clicked.append(True)
+        return True
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+
+    page = _FinalizePage()  # url is a valid /c/<id> → landing gate passes
+    conv = _ConversationUrl()
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["status"] == "stopped"
+    assert result["reason"] == "stopped_after_send"
+    assert result["exit_code"] == 5
+    assert clicked == [True]
+    assert not (tmp_path / "response.md").exists()
+
+
+async def test_monitor_stop_on_drifted_tab_never_clicks(_finalize_env, tmp_path):
+    # A stop on a tab that drifted to a DIFFERENT conversation must NOT click Stop
+    # (halting an unowned conversation) — it returns conversation_drift instead.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+    clicked = []
+
+    async def _click(_page):
+        clicked.append(True)
+        return True
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+
+    conv = _ConversationUrl()
+    conv.capture("https://chatgpt.com/c/OWNED")             # we own OWNED
+    page = _FinalizePage(url="https://chatgpt.com/c/OTHER")  # tab drifted to OTHER
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["reason"] == "conversation_drift"
+    assert clicked == []  # never acted on the unowned conversation
+
+
+async def test_monitor_stop_retries_until_positive_click(_finalize_env, tmp_path):
+    # A missing/failed Stop click is NOT proof the turn halted (the Pro thinking
+    # phase shows no Stop button). The loop must retry, never finalize `stopped`
+    # on a non-click — only a POSITIVE click yields `stopped`.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+    calls = []
+
+    async def _click(_page):
+        calls.append(True)
+        return len(calls) >= 2  # False the first time, True the second
+
+    async def _no_text(_page):
+        return ""  # never completes on its own
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+    _finalize_env.setattr(cli, "read_latest_assistant_text", _no_text)
+
+    page = _FinalizePage()
+    conv = _ConversationUrl()
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["status"] == "stopped"  # eventually stopped
+    assert len(calls) >= 2                 # did NOT falsely claim stopped on the first (False) click
+
+
+async def test_monitor_stop_discards_staged_partial(_finalize_env, tmp_path):
+    # Discard policy: a stopped run removes any partial staged by a prior attempt
+    # so it never leaves a response artifact.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+    (tmp_path / cli.RESPONSE_STAGED).write_text("partial from a prior attempt")
+
+    async def _click(_page):
+        return True
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+
+    page = _FinalizePage()
+    conv = _ConversationUrl()
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["status"] == "stopped"
+    assert not (tmp_path / cli.RESPONSE_STAGED).exists()  # staged partial discarded
+
+
+async def test_monitor_positive_click_survives_close_during_diagnostics(_finalize_env, tmp_path):
+    # A CONFIRMED positive Stop click must yield `stopped` even if the tab closes
+    # during the post-click diagnostics (screenshot / final.html). The close must
+    # NOT raise RunPageClosed into recovery — recovery would lose the confirmed
+    # stop and could republish the halted turn as `ok`.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+
+    async def _click(_page):
+        return True  # positive confirmation
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+
+    class _CloseOnContentPage(_FinalizePage):
+        def is_closed(self):
+            return True
+
+        async def content(self):
+            raise RuntimeError("target closed")  # close during final.html capture
+
+    page = _CloseOnContentPage()
+    conv = _ConversationUrl()
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["status"] == "stopped"          # not RunPageClosed, not ok
+    assert result["reason"] == "stopped_after_send"
+    assert not (tmp_path / "response.md").exists()
+
+
+async def test_monitor_positive_click_survives_staged_unlink_failure(_finalize_env, tmp_path):
+    # A non-FileNotFoundError failure removing the staged partial after a CONFIRMED
+    # click must NOT escape and lose the stop — cleanup is best-effort.
+    import asyncio
+
+    (tmp_path / cli.STOP_REQUEST).write_text("{}")
+    # A directory at the staged path makes unlink() raise OSError, not FileNotFoundError.
+    (tmp_path / cli.RESPONSE_STAGED).mkdir()
+
+    async def _click(_page):
+        return True
+
+    _finalize_env.setattr(cli, "_click_stop_button", _click)
+
+    page = _FinalizePage()
+    conv = _ConversationUrl()
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1",
+        deadline=now + 100.0, send_ts=now, conv=conv, err=_noop_err,
+    )
+    assert result["status"] == "stopped"
+
+
 async def test_monitor_closure_raises_run_page_closed(_finalize_env, tmp_path):
     import asyncio
 
@@ -961,6 +1127,17 @@ class _FakeCtx:
 @pytest.fixture
 def _postsend_env(monkeypatch):
     monkeypatch.setattr(cli, "_attach_response_logger", lambda _p, _n: None)
+
+    # Record every page the rate-limit dismisser is installed on so recovery
+    # tests can assert each reopened tab is re-protected (like the response
+    # logger), not just the initial one.
+    installs = []
+
+    async def _record_install(page):
+        installs.append(page)
+
+    monkeypatch.setattr(cli, "_install_rate_limit_dismisser", _record_install)
+    monkeypatch.rate_limit_installs = installs
     return monkeypatch
 
 
@@ -1008,6 +1185,7 @@ async def test_postsend_recovers_once_returns_new_page(_postsend_env, tmp_path):
     assert ctx.new_page_calls == 1
     assert page is p1                  # returns the LATEST owned page for cleanup
     assert monitor.calls == [p0, p1]   # re-finalized on the reopened tab
+    assert p1 in _postsend_env.rate_limit_installs  # dismisser re-installed on the reopened tab
 
 
 async def test_postsend_no_url_terminal_no_reopen(_postsend_env, tmp_path):
