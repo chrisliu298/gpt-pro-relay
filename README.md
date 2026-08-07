@@ -35,15 +35,25 @@ No daemon. No HTTP server. No queue. SSH is the transport. The worker is detache
 Requires:
 
 - A Mac that stays logged into its GUI session. Playwright drives real Chrome and needs WindowServer access, so a headless box won't work — leave the Mac signed in (and use `caffeinate` if it sleeps).
-- Python 3.11+, [uv](https://docs.astral.sh/uv/), and Google Chrome (real Chrome, not bundled Chromium — auth and anti-abuse behave differently).
+- Python 3.11+, [uv](https://docs.astral.sh/uv/), and the side-by-side Google Chrome Beta app. The relay needs real Chrome (not bundled Chromium), while Beta's distinct macOS bundle identity keeps it from intercepting Stable Chrome's Dock and update lifecycle.
 - A ChatGPT Pro account.
 
 ```bash
+brew install --cask google-chrome@beta
 uv sync
-uv run gpt-pro-relay login    # opens Chrome; sign in to ChatGPT manually
+uv run gpt-pro-relay login    # opens Chrome Beta; sign in to ChatGPT manually
 ```
 
 Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **GPT-5.6 Sol** + **Pro** once so the account preference is set.
+
+The default app is `/Applications/Google Chrome Beta.app`. `GPT_PRO_CHROME_APP` may select a Chrome Dev or Canary app with a recognized side-by-side bundle identity, but the relay rejects Stable Chrome's `com.google.Chrome` bundle identity instead of silently recreating the Dock conflict. Existing installations that previously used Stable should migrate while no workers are running:
+
+```bash
+gpt-pro-relay close-chrome
+brew install --cask google-chrome@beta
+uv run gpt-pro-relay login
+uv run gpt-pro-relay doctor
+```
 
 ### Optional: bare command on PATH
 
@@ -60,11 +70,11 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 
 | Command | What it does |
 |---|---|
-| `gpt-pro-relay login` | Open Chrome at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
+| `gpt-pro-relay login` | Open the isolated Chrome Beta app at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
 | `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **GPT-5.6 Sol** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
 | `gpt-pro-relay ask [--run-id ID] [--no-wait] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits for completion, prints response on stdout. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
-| `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses by default if any worker holds a `ParallelSlot`; pass `--force` to kill anyway (in-flight runs lose their CDP connection). |
+| `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses while a worker, `login`, or `doctor` holds a browser activity lease; pass `--force` to kill anyway (active users lose their CDP connection). |
 
 ## Usage
 
@@ -154,7 +164,9 @@ A run leaves **at most one** of those four names (a failure before extraction pu
 
 ## Concurrency
 
-Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
+Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome Beta process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). The isolated browser stays alive between runs. Workers, `login`, and `doctor` hold shared browser activity leases; normal `close-chrome` must acquire the exclusive lease, so it cannot race a new browser user or terminate an active one.
+
+Because Chrome Beta stays alive indefinitely, restart it periodically after its updater downloads a security update: wait for active browser users to finish, run `gpt-pro-relay close-chrome`, then run `gpt-pro-relay doctor` to relaunch and verify it.
 
 ## Closing the Chrome tab mid-run
 

@@ -106,6 +106,10 @@ def _wire_recovery(monkeypatch, tmp_path):
     slots = tmp_path / "slots"
     slots.mkdir(exist_ok=True)
     monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+    beta = tmp_path / "Google Chrome Beta.app"
+    monkeypatch.setattr(cli, "chrome_app_path", lambda: beta)
+    monkeypatch.setattr(cli, "validate_chrome_app", lambda app: app)
+    monkeypatch.setattr(cli, "_require_running_chrome_app", lambda *_a: None)
     monkeypatch.setattr(cli, "LaunchLock", _DummyLock)
     monkeypatch.setattr(cli.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(cli, "log_stage", lambda *_a, **_k: None)

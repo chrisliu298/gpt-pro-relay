@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -18,6 +19,7 @@ PROFILE = Path.home() / ".gpt-pro-profile"
 STATE = Path.home() / ".gpt-pro"
 RUNS = STATE / "runs"
 LAUNCH_LOCK = STATE / "launch.lock"
+CHROME_ACTIVITY_LOCK = STATE / "chrome-activity.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
@@ -71,7 +73,13 @@ SEND_LANDING_TIMEOUT = 20.0
 # port all fail this and are never persisted or reopened.
 CONVERSATION_ID_RE = re.compile(r"^/c/([A-Za-z0-9-]+)$")
 
-CHROME_APP = "/Applications/Google Chrome.app"
+DEFAULT_CHROME_APP = Path("/Applications/Google Chrome Beta.app")
+CHROME_APP_ENV = "GPT_PRO_CHROME_APP"
+SIDE_BY_SIDE_CHROME_BUNDLE_IDS = {
+    "com.google.Chrome.beta",
+    "com.google.Chrome.dev",
+    "com.google.Chrome.canary",
+}
 LAUNCH_DEBUG_PORT = 19222
 
 
@@ -88,7 +96,7 @@ def get_max_parallel() -> int:
         log_stage("max_parallel_clamped", requested=n, effective=clamped, ceiling=MAX_PARALLEL_CEILING)
     return clamped
 
-# Chrome flags passed via /usr/bin/open. Curated subset of what Playwright
+# Side-by-side Chrome flags passed via /usr/bin/open. Curated subset of what Playwright
 # would normally pass via launch_persistent_context. Why the LaunchServices
 # launch: a process spawned via direct exec from a sshd-detached Popen worker
 # bypasses LaunchServices; the resulting Chrome has no app registration,
@@ -111,6 +119,62 @@ CHROME_OPEN_ARGS = [
     "--disable-features=DestroyProfileOnBrowserClose,DialMediaRouteProvider,MediaRouter,Translate,HttpsUpgrades,PaintHolding",
     "--window-size=1280,800",
 ]
+
+
+def chrome_app_path() -> Path:
+    """Return the configured side-by-side Chrome application path."""
+    return Path(os.environ.get(CHROME_APP_ENV, str(DEFAULT_CHROME_APP))).expanduser()
+
+
+def _chrome_app_info(app: Path) -> dict:
+    info_path = app / "Contents" / "Info.plist"
+    try:
+        with info_path.open("rb") as f:
+            return plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException) as e:
+        raise RuntimeError(f"Cannot read Chrome app metadata at {info_path}: {e}") from e
+
+
+def validate_chrome_app(app: Path) -> Path:
+    """Fail closed unless ``app`` has an official side-by-side Chrome identity.
+
+    A dedicated ``--user-data-dir`` isolates browser data, not LaunchServices.
+    Stable Chrome's ``com.google.Chrome`` identity would let the relay consume
+    normal Dock/New Window activation and block Stable updates from relaunching
+    cleanly. Beta/Dev/Canary have distinct signed bundle identities on macOS.
+    """
+    if not app.is_dir():
+        raise RuntimeError(
+            f"Configured Chrome app does not exist: {app}. "
+            "Install side-by-side Chrome Beta or set GPT_PRO_CHROME_APP."
+        )
+    info = _chrome_app_info(app)
+    bundle_id = info.get("CFBundleIdentifier")
+    if bundle_id == "com.google.Chrome":
+        raise RuntimeError(
+            "Configured Chrome app uses com.google.Chrome, the Stable Chrome "
+            "bundle identity; using it for gpt-pro hijacks Dock/New Window "
+            "activation. Install side-by-side Chrome Beta instead."
+        )
+    if bundle_id not in SIDE_BY_SIDE_CHROME_BUNDLE_IDS:
+        allowed = ", ".join(sorted(SIDE_BY_SIDE_CHROME_BUNDLE_IDS))
+        raise RuntimeError(
+            f"Configured Chrome app has unsupported bundle identity {bundle_id!r}; "
+            f"expected an official side-by-side Chrome channel: {allowed}."
+        )
+    executable = info.get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable:
+        raise RuntimeError(f"Configured Chrome app has no CFBundleExecutable: {app}")
+    executable_path = app / "Contents" / "MacOS" / executable
+    if not executable_path.is_file() or not os.access(executable_path, os.X_OK):
+        raise RuntimeError(
+            f"Configured Chrome app executable is missing or not runnable: {executable_path}"
+        )
+    return app
+
+
+def _chrome_executable(app: Path) -> Path:
+    return app / "Contents" / "MacOS" / _chrome_app_info(app)["CFBundleExecutable"]
 
 
 def _chrome_open_argv(port: int) -> list[str]:
@@ -146,11 +210,8 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
         log_stage("pin_viewport_skipped", exception=f"{type(e).__name__}: {e}")
 
 
-def _find_chrome_browser_pid() -> int | None:
-    """Return the PID of the gpt-pro Chrome BROWSER process — the parent that
-    owns the Cocoa window. Helper/renderer processes carry --type= in argv and
-    don't own windows; activating them is a no-op.
-    """
+def _find_chrome_browser_process() -> tuple[int, str] | None:
+    """Return the PID and command of the gpt-pro Chrome browser process."""
     try:
         out = subprocess.run(
             ["pgrep", "-fl", f"user-data-dir={PROFILE}"],
@@ -164,8 +225,55 @@ def _find_chrome_browser_pid() -> int | None:
         except ValueError:
             continue
         if "--type=" not in cmd:
-            return int(pid_str)
+            return int(pid_str), cmd
     return None
+
+
+def _find_chrome_browser_pid() -> int | None:
+    """Return the gpt-pro browser PID, excluding helper/renderer processes."""
+    process = _find_chrome_browser_process()
+    return process[0] if process is not None else None
+
+
+def _tcp_listener_pids(port: int) -> set[int]:
+    """Return PIDs listening on ``port`` according to macOS lsof."""
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return set()
+    pids = set()
+    for value in result.stdout.split():
+        try:
+            pids.add(int(value))
+        except ValueError:
+            continue
+    return pids
+
+
+def _require_running_chrome_app(app: Path, port: int) -> None:
+    """Require the configured app's profile process to own the CDP listener."""
+    process = _find_chrome_browser_process()
+    if process is None:
+        raise RuntimeError(
+            "Chrome CDP is responding but its browser process was not found; "
+            "run `gpt-pro-relay close-chrome --force` and retry."
+        )
+    _pid, command = process
+    executable = str(_chrome_executable(app))
+    if command != executable and not command.startswith(f"{executable} "):
+        raise RuntimeError(
+            "The running gpt-pro Chrome does not match GPT_PRO_CHROME_APP. "
+            "Wait for active runs, run `gpt-pro-relay close-chrome`, then retry "
+            "so the isolated browser can launch."
+        )
+    if _pid not in _tcp_listener_pids(port):
+        raise RuntimeError(
+            f"The configured gpt-pro Chrome process does not own CDP port {port}; "
+            "run `gpt-pro-relay close-chrome --force` and retry."
+        )
 
 
 def bind_chrome_compositor_surface() -> None:
@@ -314,13 +422,16 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
     don't need to bind — Chrome's compositor stays bound for the rest of its
     lifetime once activated.
     """
+    app = validate_chrome_app(chrome_app_path())
     if probe_cdp(port):
+        _require_running_chrome_app(app, port)
         return False
     with LaunchLock():
         # Re-probe with a longer timeout — under contention the 1s fast-path
         # probe can falsely fail. Two retries with 0.5s backoff.
         for _ in range(2):
             if probe_cdp(port, timeout=3.0):
+                _require_running_chrome_app(app, port)
                 return False
             time.sleep(0.5)
         # CDP is genuinely unresponsive. Refuse to kill if other workers are
@@ -335,7 +446,7 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
         _kill_chrome_orphans()
         argv = _chrome_open_argv(port)
         subprocess.Popen(
-            ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv],
+            ["/usr/bin/open", "-n", "-a", str(app), "--args", *argv],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -343,6 +454,7 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
         deadline = time.time() + 30
         while time.time() < deadline:
             if probe_cdp(port):
+                _require_running_chrome_app(app, port)
                 log_stage("chrome_cdp_ready", port=port)
                 bind_chrome_compositor_surface()
                 return True
@@ -1067,6 +1179,11 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 # ---- doctor ----
 
 async def cmd_doctor() -> int:
+    with ChromeActivityLease():
+        return await _cmd_doctor_with_browser()
+
+
+async def _cmd_doctor_with_browser() -> int:
     run_dir = new_run_dir("doctor")
     ensure_shared_chrome_running()
     async with async_playwright() as pw:
@@ -1122,6 +1239,11 @@ async def cmd_doctor() -> int:
 # ---- login ----
 
 async def cmd_login() -> int:
+    with ChromeActivityLease():
+        return await _cmd_login_with_browser()
+
+
+async def _cmd_login_with_browser() -> int:
     ensure_shared_chrome_running()
     async with async_playwright() as pw:
         ctx = await connect_shared_chrome(pw)
@@ -1638,10 +1760,40 @@ class _FlockGuard:
 
 
 class LaunchLock(_FlockGuard):
-    """Held only across the CDP-probe-and-conditional-launch path. Never held during
-    a run's per-tab work — that would re-introduce the old whole-section serialization."""
+    """Serialize launch/recovery and explicit shutdown, never per-tab work."""
     def __init__(self):
         super().__init__(LAUNCH_LOCK)
+
+
+class ChromeActivityLease(_FlockGuard):
+    """Shared browser-use lease; shutdown takes the same flock exclusively.
+
+    Workers, login, and doctor hold ``LOCK_SH`` for their complete Chrome use.
+    A normal ``close-chrome`` takes ``LOCK_EX | LOCK_NB`` before the shutdown
+    check and kill, so no new browser user can enter the check-to-kill window.
+    Kernel-released flock ownership stays correct across process crashes without
+    a refcount or persistent state database.
+    """
+    def __init__(self, *, exclusive: bool = False, blocking: bool = True):
+        super().__init__(CHROME_ACTIVITY_LOCK, blocking=blocking)
+        self.exclusive = exclusive
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(self.path, "w")
+        flags = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        if not self.blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd.fileno(), flags)
+        except BlockingIOError:
+            fd.close()
+            return False
+        except BaseException:
+            fd.close()
+            raise
+        self._fd = fd
+        return True
 
 
 class RunClaim(_FlockGuard):
@@ -1773,10 +1925,16 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         log_stage("stopped", reason="stopped_before_send", phase="pre_slot")
         return _stopped_result(run_id, run_dir, "stopped_before_send")
     try:
-        with ParallelSlot(get_max_parallel(), stop_check=lambda: stop_requested(run_dir)) as slot:
-            # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
-            # the worker counts its own held slot and never recovers (see _slots_held).
-            return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot.slot_id)
+        # Activity must precede slot admission. If close-chrome already owns the
+        # exclusive lease, a new worker blocks here without taking a slot that
+        # shutdown could mistake for an older lease-less active worker.
+        with ChromeActivityLease():
+            with ParallelSlot(get_max_parallel(), stop_check=lambda: stop_requested(run_dir)) as slot:
+                # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
+                # the worker counts its own held slot and never recovers (see _slots_held).
+                return await _run_with_browser(
+                    run_id, run_dir, prompt_text, network_log, err, slot.slot_id,
+                )
     except RunStopped:
         log_stage("stopped", reason="stopped_before_send", phase="queued")
         return _stopped_result(run_id, run_dir, "stopped_before_send")
@@ -2609,22 +2767,38 @@ async def _run_claimed(run_id: str, run_dir: Path) -> int:
 # ---- close-chrome ----
 
 def cmd_close_chrome(force: bool = False) -> int:
-    """Tear down the shared gpt-pro Chrome process. Held under LaunchLock.
+    """Tear down the shared gpt-pro Chrome under an exclusive activity lease.
 
-    Refuses by default when any worker holds a ParallelSlot — killing Chrome
-    out from under live tabs costs in-flight Pro runs (5–20 min each).
-    Pass --force to bypass.
+    Normal shutdown fails fast while a worker, login, or doctor holds a shared
+    lease. Once the exclusive lease is acquired, new browser users cannot enter
+    until shutdown finishes. ``--force`` deliberately bypasses a contended lease
+    and may terminate any active browser user.
     """
-    with LaunchLock():
-        if not force and _slots_held():
-            stderr_jsonl({
-                "status": "error",
-                "reason": "workers_in_flight",
-                "hint": "Wait for active runs to finish, or pass --force.",
-            })
-            return 1
-        _kill_chrome_orphans()
-    return 0
+    lease = ChromeActivityLease(exclusive=True, blocking=False)
+    acquired = lease.acquire()
+    if not acquired and not force:
+        stderr_jsonl({
+            "status": "error",
+            "reason": "browser_in_use",
+            "hint": "Wait for active workers, login, or doctor to finish, or pass --force.",
+        })
+        return 1
+    try:
+        with LaunchLock():
+            # Defense for workers from older code that hold ParallelSlot but not
+            # ChromeActivityLease. Current workers are already excluded by LOCK_EX.
+            if not force and _slots_held():
+                stderr_jsonl({
+                    "status": "error",
+                    "reason": "workers_in_flight",
+                    "hint": "Wait for active runs to finish, or pass --force.",
+                })
+                return 1
+            _kill_chrome_orphans()
+        return 0
+    finally:
+        if acquired:
+            lease.release()
 
 
 # ---- main ----
@@ -2634,9 +2808,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="Open Chrome on chatgpt.com to sign in. Cookies persist for `ask`.")
     sub.add_parser("doctor", help="Verify the profile is logged in. Prints JSON; saves screenshot + HTML.")
-    close_p = sub.add_parser("close-chrome", help="Tear down the shared gpt-pro Chrome. Refuses if workers are in flight.")
+    close_p = sub.add_parser("close-chrome", help="Tear down shared gpt-pro Chrome. Refuses while the browser is in use.")
     close_p.add_argument("--force", action="store_true",
-                         help="Kill Chrome even if workers hold ParallelSlots. In-flight runs will lose their CDP connection.")
+                         help="Kill Chrome even while in use. Active workers/login/doctor lose their CDP connection.")
 
     ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT GPT-5.6 Sol Pro. Prints response on stdout when ready.")
     ask_p.add_argument("--run-id", default=None,
