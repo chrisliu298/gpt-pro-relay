@@ -794,6 +794,35 @@ MODEL_ROW = re.compile(r"Model")
 EFFORT_ROW = re.compile(r"Effort")
 
 
+# Ids of every *open* menu. Radix keeps a dismissed menu mounted through its
+# exit animation (`data-state="closed"`), so filtering on the state — not just
+# on `[role=menu]` — is what stops a closing menu counting as a live one.
+OPEN_MENU_IDS_JS = (
+    """() => Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))"""
+    """.map(m => m.id)"""
+)
+
+
+async def _open_chip_menu(page, chip, *, timeout: float = 5.0) -> None:
+    """Open the chip menu — unless it is already open.
+
+    The chip is a TOGGLE: clicking it while `aria-expanded="true"` closes the
+    menu. A caller that clicks unconditionally therefore inverts the state
+    whenever it enters with the menu already open, leaving only menus in their
+    exit animation for `_open_chip_submenu` to resolve. Reproduced live:
+    `read_selected_model` called straight after `ensure_pro_chip` (which returns
+    with its menu still open) read the model as None — and a None model read is
+    the fail-OPEN `unverified_missing_slug` verdict, so this silently weakens
+    the missing-slug backstop rather than announcing itself.
+
+    Production does not hit that ordering today (the composer click between them
+    dismisses the menu), so this guard is about not depending on that accident.
+    """
+    if await chip.get_attribute("aria-expanded") != "true":
+        await chip.click(timeout=timeout * 1000)
+    await page.wait_for_selector('[role="menu"]', timeout=timeout * 1000)
+
+
 async def _open_chip_submenu(page, row_pattern, *, timeout: float = 5.0):
     """Open the chip menu's "Model" or "Effort" submenu; return its locator.
 
@@ -802,14 +831,35 @@ async def _open_chip_submenu(page, row_pattern, *, timeout: float = 5.0):
     matches in the compact state).
 
     Expansion is deliberately BEST-EFFORT: a relabelled toggle must not brick
-    the send path, because the real gates are downstream and fail closed anyway
-    (the chip must read `is_pro_label`, and the served slug must be in
-    PRO_MODEL_SLUGS). Navigation is forgiving; verification is not.
+    the *send* path, whose own gate is fail-closed (`ensure_pro_chip` returns
+    False → `model_select_failed`, and the chip must still read `is_pro_label`).
+    Note this is NOT true of the other caller: `read_selected_model` degrades to
+    None, which `classify_served_audit` treats as `unverified_missing_slug` —
+    a deliberate fail-OPEN. So a swallowed failure here weakens the missing-slug
+    backstop rather than tripping a gate; that is the accepted cost of not
+    bricking on a cosmetic relabel, not a claim that everything downstream
+    fails closed.
 
-    The `count() >= 2` poll is load-bearing: `[role=menu].last` before the
-    submenu mounts returns the MAIN menu, whose checked radio is a different
-    axis — the old code read the effort tier as if it were the model. Raises if
-    the submenu never mounts, so callers fail closed rather than read menu 0.
+    IDENTIFYING THE SUBMENU IS THE SAFETY-CRITICAL PART. A global
+    `[role=menu].last` (or a bare count >= 2) asks only whether *some* second
+    menu exists, not whether it is the one this row owns. That is reachable, not
+    theoretical: a menu dismissed a moment earlier stays in the DOM through its
+    exit animation, so `.last` can resolve a stale menu — observed live, where a
+    `read_selected_model` call entered with menus still open and returned None.
+    Both misreads are bad in different directions:
+
+      - resolving the MAIN menu → it holds a slider and NO checked
+        `menuitemradio` (2026-08), so the read yields None → the fail-OPEN
+        `unverified_missing_slug` verdict, silently losing the backstop;
+      - resolving a stale EFFORT submenu → reads "Pro" as if it were a model
+        name → `menu_mismatch`, a FATAL verdict on a healthy run.
+
+    So resolve by ownership: Radix links an open row to its submenu with
+    `aria-controls` -> the menu's `id` (and back via `aria-labelledby`). Prefer
+    that link; fall back to "the menu that newly OPENED as a result of this
+    click", which excludes both the main menu and any pre-existing stale one
+    without depending on a Radix attribute name. Raise if neither resolves, so
+    callers fail closed rather than read an arbitrary menu.
     """
     expand = page.locator(
         f'[role="menu"] [role="menuitem"][aria-label="{ADVANCED_EXPAND_LABEL}"]'
@@ -825,14 +875,27 @@ async def _open_chip_submenu(page, row_pattern, *, timeout: float = 5.0):
         .filter(has_text=row_pattern)
         .first
     )
-    await row.click(timeout=timeout * 1000)
+    # Menus already open BEFORE this click — the main menu plus anything stale.
+    # Whatever we return must not be one of these.
+    preexisting = set(await page.evaluate(OPEN_MENU_IDS_JS))
+
+    # Re-entrancy: clicking a row that is already expanded COLLAPSES it. Read
+    # the owned menu instead of toggling it shut.
+    if await row.get_attribute("aria-expanded") != "true":
+        await row.click(timeout=timeout * 1000)
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if await page.locator('[role="menu"]').count() >= 2:
-            return page.locator('[role="menu"]').last
+        controls = await row.get_attribute("aria-controls")
+        if controls:
+            owned = page.locator(f'[role="menu"][id="{controls}"][data-state="open"]')
+            if await owned.count() == 1:
+                return owned
+        fresh = [i for i in await page.evaluate(OPEN_MENU_IDS_JS) if i not in preexisting]
+        if len(fresh) == 1:
+            return page.locator(f'[role="menu"][id="{fresh[0]}"]')
         await asyncio.sleep(0.1)
-    raise RuntimeError(f"chip submenu {row_pattern.pattern!r} did not mount")
+    raise RuntimeError(f"chip submenu {row_pattern.pattern!r} did not open")
 
 
 async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
@@ -861,9 +924,8 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
         bind_chrome_compositor_surface()
         await bring_tab_to_front(page)
 
-        await chip.click()
         try:
-            await page.wait_for_selector('[role="menu"]', timeout=5000)
+            await _open_chip_menu(page, chip)
         except Exception as e:
             await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
             (run_dir / "error.html").write_text(await page.content())
@@ -961,8 +1023,7 @@ async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
     """
     chip = page.locator(COMPOSER_CHIP).first
     try:
-        await chip.click()
-        await page.wait_for_selector('[role="menu"]', timeout=timeout * 1000)
+        await _open_chip_menu(page, chip, timeout=timeout)
         submenu = await _open_chip_submenu(page, MODEL_ROW, timeout=timeout)
         deadline = time.time() + 3.0
         model = None
