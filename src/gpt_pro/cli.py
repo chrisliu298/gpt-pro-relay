@@ -758,22 +758,81 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
     return ""
 
 
-# The 2026-07 GPT-5.6 redesign split the chip menu into two axes. The flat
-# "Intelligence" list (data-testid="composer-intelligence-picker-content") holds
-# the effort tiers — Instant / Medium / High / Extra High / Pro — each a
-# role='menuitemradio' with a plain-text label; "Pro" is the top tier and maps
-# to the gpt-5-6-pro served slug. Selecting it flips the chip to the stable label
-# "Pro". A separate model submenu (a role='menuitem' with aria-haspopup='menu'
-# labeled "GPT-5.6 Sol") sets the model, but the model is a persistent account
-# preference — a freshly loaded chatgpt.com (every worker's starting point)
-# defaults to Sol — and it is verified fail-closed post-send by the served-slug
-# audit. So the slow path corrects only the *effort* and never navigates the
-# fragile, hover-driven model submenu. The "Pro" radio carries no data-testid, so
-# we match on its exact accessible name; that also excludes the icon-only "Pro
-# effort options" config button (a role='menuitem', not menuitemradio, whose
-# accessible name is "Pro effort options", that appears when the Pro row is
-# focused).
+# The 2026-08 redesign replaced the flat "Intelligence" effort list with a
+# TWO-LEVEL chip menu (verified live 2026-08-06):
+#
+#   [role=menu]                       <- opened by clicking COMPOSER_CHIP
+#     role=menuitem  aria-label="Power"      <- wraps a role=slider, 0..4
+#     role=menuitem  "Advanced"              <- toggle, see below
+#     role=menuitem  "Model\nGPT-5.6 Sol"    aria-haspopup=menu
+#     role=menuitem  "Effort\nPro"           aria-haspopup=menu
+#       └─ [role=menu] Instant / Medium / High / Extra High / Pro  (menuitemradio)
+#
+# The named effort leaves SURVIVED the redesign — they just moved one level
+# deeper, behind the "Effort" row. So selection stays a name-anchored
+# menuitemradio click rather than a slider drag: the slider would force us to
+# *infer* "top position == Pro" from a numeric index, whereas the radio lets us
+# read the tier we are selecting. (The slider is the same axis — it reads
+# "Pro, 5 of 5" once Pro is selected — it is simply the weaker signal.)
+#
+# Two gotchas, both load-bearing:
+#   1. The Model/Effort rows sit behind the "Advanced" toggle, which resets to
+#      COMPACT on every page load (measured: the expanded state does not
+#      persist across a reload, unlike the effort selection itself). So every
+#      run must expand before it can reach the rows. The toggle's aria-label is
+#      directional — "Show advanced options" while compact, "Show compact
+#      options" while expanded — so keying on the expand label makes the click
+#      idempotent instead of a blind toggle that would collapse an already-open
+#      menu.
+#   2. The rows open on CLICK, not hover. Each row is a wrapper div whose inner
+#      button/span swallows pointer events, so Playwright's hover never lands
+#      ("subtree intercepts pointer events" — this is what silently broke the
+#      old hover-driven model read).
 PRO_LABEL = "Pro"
+ADVANCED_EXPAND_LABEL = "Show advanced options"  # present ONLY while compact
+MODEL_ROW = re.compile(r"Model")
+EFFORT_ROW = re.compile(r"Effort")
+
+
+async def _open_chip_submenu(page, row_pattern, *, timeout: float = 5.0):
+    """Open the chip menu's "Model" or "Effort" submenu; return its locator.
+
+    Assumes the chip menu itself is already open. Expands the "Advanced" toggle
+    first (no-op when already expanded, since the expand-label locator only
+    matches in the compact state).
+
+    Expansion is deliberately BEST-EFFORT: a relabelled toggle must not brick
+    the send path, because the real gates are downstream and fail closed anyway
+    (the chip must read `is_pro_label`, and the served slug must be in
+    PRO_MODEL_SLUGS). Navigation is forgiving; verification is not.
+
+    The `count() >= 2` poll is load-bearing: `[role=menu].last` before the
+    submenu mounts returns the MAIN menu, whose checked radio is a different
+    axis — the old code read the effort tier as if it were the model. Raises if
+    the submenu never mounts, so callers fail closed rather than read menu 0.
+    """
+    expand = page.locator(
+        f'[role="menu"] [role="menuitem"][aria-label="{ADVANCED_EXPAND_LABEL}"]'
+    )
+    try:
+        if await expand.count():
+            await expand.first.click(timeout=timeout * 1000)
+    except Exception:
+        pass  # best-effort: the row may already be reachable
+
+    row = (
+        page.locator('[role="menu"] [role="menuitem"][aria-haspopup="menu"]')
+        .filter(has_text=row_pattern)
+        .first
+    )
+    await row.click(timeout=timeout * 1000)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if await page.locator('[role="menu"]').count() >= 2:
+            return page.locator('[role="menu"]').last
+        await asyncio.sleep(0.1)
+    raise RuntimeError(f"chip submenu {row_pattern.pattern!r} did not mount")
 
 
 async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
@@ -786,11 +845,12 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
     Slow path (chip in a wrong effort): held under `UiClipboardLock` plus a
     `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
     and `keyboard.press("Escape")` on cleanup paths can close the wrong menu if a
-    concurrent worker brings its tab to front. It opens the chip menu and clicks
-    the "Pro" effort leaf (role='menuitemradio') directly. It does NOT touch the
-    model submenu — the model comes from the account default and is verified
-    fail-closed post-send by the served-slug audit; self-correcting it here would
-    add fragile submenu navigation for a rare drift the audit already catches.
+    concurrent worker brings its tab to front. It opens the chip menu, drills
+    into the "Effort" submenu (see `_open_chip_submenu`) and clicks the "Pro"
+    effort leaf (role='menuitemradio'). It does NOT touch the model submenu —
+    the model comes from the account default and is verified fail-closed
+    post-send by the served-slug audit; self-correcting it here would add a
+    second submenu navigation for a rare drift the audit already catches.
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
@@ -810,13 +870,14 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
             log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
             return False, text
 
-        # The chip menu is the newest-mounted [role=menu]. The "Pro" effort tier
-        # is a direct menuitemradio leaf — anchor the regex so a future relabel
-        # doesn't silently match (an intentional product change worth reviewing
-        # rather than auto-accepting).
-        menu = page.locator('[role="menu"]').last
-        item = menu.get_by_role("menuitemradio", name=re.compile(rf"^{re.escape(PRO_LABEL)}$"))
+        # Drill into the "Effort" submenu, then click the "Pro" leaf. Anchor the
+        # regex so a future relabel doesn't silently match (an intentional
+        # product change worth reviewing rather than auto-accepting).
         try:
+            submenu = await _open_chip_submenu(page, EFFORT_ROW)
+            item = submenu.get_by_role(
+                "menuitemradio", name=re.compile(rf"^{re.escape(PRO_LABEL)}$")
+            )
             await item.first.click(timeout=5000)
         except Exception as e:
             await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
@@ -891,35 +952,26 @@ def classify_served_audit(served_slug: str | None, menu_model: str | None) -> st
 async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
     """Return the currently-selected model's label from the chip menu, or None.
 
-    Read-only diagnostic (no selection, no send). Opens the Intelligence menu,
-    hovers the model submenu trigger — the `aria-haspopup='menu'` menuitem WITH
-    visible text, which excludes the icon-only "Pro effort options" config button
-    (empty text) — waits for the submenu, and reads its checked model radio. The
-    submenu-mounted guard (`count() >= 2`) is load-bearing: the *main* menu's
-    checked radio is the "Pro" EFFORT tier, so reading `.last` before the submenu
-    mounts would wrongly return the effort as the model. Returns None on any
-    failure so `doctor` degrades to "unknown" rather than erroring. Always closes
-    the menu with Escape.
+    Read-only diagnostic (no selection, no send). Opens the chip menu, drills
+    into the "Model" submenu (`_open_chip_submenu` — which expands "Advanced"
+    and CLICKS the row; the pre-2026-08 hover never lands on the new wrapper
+    rows) and reads its checked model radio. Returns None on any failure so
+    `doctor` degrades to "unknown" rather than erroring. Always closes the menu
+    with Escape.
     """
     chip = page.locator(COMPOSER_CHIP).first
     try:
         await chip.click()
         await page.wait_for_selector('[role="menu"]', timeout=timeout * 1000)
-        trigger = page.locator(
-            '[role="menu"] [role="menuitem"][aria-haspopup="menu"]'
-        ).filter(has_text=re.compile(r"\S")).first
-        await trigger.hover()
-        await page.locator('[role="menu"]').nth(1).wait_for(state="visible", timeout=timeout * 1000)
+        submenu = await _open_chip_submenu(page, MODEL_ROW, timeout=timeout)
         deadline = time.time() + 3.0
         model = None
         while time.time() < deadline:
-            if await page.locator('[role="menu"]').count() >= 2:
-                submenu = page.locator('[role="menu"]').last
-                model = await submenu.evaluate(
-                    """m => { const r = m.querySelector('[role="menuitemradio"][aria-checked="true"]'); return r ? (r.innerText || '').trim() : null; }"""
-                )
-                if model:
-                    break
+            model = await submenu.evaluate(
+                """m => { const r = m.querySelector('[role="menuitemradio"][aria-checked="true"]'); return r ? (r.innerText || '').trim() : null; }"""
+            )
+            if model:
+                break
             await asyncio.sleep(0.2)
         return model or None
     except Exception:
