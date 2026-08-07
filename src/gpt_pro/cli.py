@@ -403,6 +403,27 @@ def _slots_held(skip_slot_id: int | None = None) -> bool:
     return False
 
 
+def _cdp_timeout_message(port: int) -> str:
+    """Report what is observable at the timeout, not a guess at the cause.
+
+    "No Chrome at all" and "Chrome is up but never bound the port" are very
+    different failures, and the bare timeout used to hide which one happened.
+    The second is what a freshly installed Chrome held before execution looks
+    like (README *Troubleshooting*) — so name the observation and point at the
+    docs, rather than asserting a cause the relay cannot actually determine.
+    """
+    base = f"Chrome CDP not ready on port {port} after 30s"
+    process = _find_chrome_browser_process()
+    if process is None:
+        return f"{base}; no Chrome process is bound to {PROFILE}."
+    pid, cmd = process
+    return (
+        f"{base}, but a Chrome process IS running (pid {pid}) and never bound "
+        f"the port. A never-launched Chrome app can be held by macOS before it "
+        f"executes — see README Troubleshooting. argv: {cmd}"
+    )
+
+
 def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: int | None = None) -> bool:
     """Idempotent: launch Chrome bound to PROFILE if its CDP isn't responding.
 
@@ -412,11 +433,21 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
 
     Kill-orphan safety: under heavy load a healthy Chrome can fail a 1s probe.
     Inside LaunchLock we re-probe with a 3s timeout and one retry, AND we refuse
-    to kill if any *other* worker is currently holding a ParallelSlot (i.e., has
-    a live tab in the same Chrome). The combination prevents the "transient CDP
-    stall under load → kill the live Chrome" failure mode. A slot-holding caller
-    MUST pass its own `skip_slot_id` so its own slot isn't mistaken for another
-    worker's — otherwise a genuinely wedged Chrome could never be recovered.
+    to kill unless *both* guards agree nobody else is using this Chrome. The
+    combination prevents the "transient CDP stall under load → kill the live
+    Chrome" failure mode.
+
+      - No *other* worker holds a ParallelSlot (i.e. has a live tab). A
+        slot-holding caller MUST pass its own `skip_slot_id` so its own slot
+        isn't mistaken for another worker's — otherwise a genuinely wedged
+        Chrome could never be recovered.
+      - This process can take the ChromeActivityLease *exclusively*. Slots do
+        not cover `login` and `doctor`: both hold a lease and take no slot, so
+        a slot-only guard killed Chrome out from under them. Held exclusively
+        across the kill+relaunch, so no new user enters the check-to-kill gap.
+
+    Callers must therefore run inside their own `ChromeActivityLease`; one that
+    holds no lease cannot prove sole use and fails closed instead of killing.
 
     On the launch path, also bind the CoreAnimation surface once. Followers
     don't need to bind — Chrome's compositor stays bound for the rest of its
@@ -443,23 +474,41 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
                 "refusing to kill shared Chrome. Wait for active runs to finish, "
                 "then run `gpt-pro-relay close-chrome --force` if Chrome is wedged."
             )
-        _kill_chrome_orphans()
-        argv = _chrome_open_argv(port)
-        subprocess.Popen(
-            ["/usr/bin/open", "-n", "-a", str(app), "--args", *argv],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if probe_cdp(port):
-                _require_running_chrome_app(app, port)
-                log_stage("chrome_cdp_ready", port=port)
-                bind_chrome_compositor_surface()
-                return True
-            time.sleep(0.3)
-        raise RuntimeError(f"Chrome CDP not ready on port {port} after 30s")
+        # ParallelSlot alone does not cover `login` and `doctor`: both hold an
+        # activity lease and take no slot, so a slot-only guard would kill Chrome
+        # out from under a human halfway through signing in. Kill only while
+        # holding the lease *exclusively* — that both proves we are the sole user
+        # and keeps the check-to-kill window closed against a new one arriving,
+        # which is exactly the property `close-chrome` gets from the same lock.
+        lease = ChromeActivityLease.held_by_this_process()
+        if lease is None or not lease.try_upgrade_exclusive():
+            raise RuntimeError(
+                "Chrome CDP unresponsive but another worker, `login`, or `doctor` "
+                "is using the shared browser (or this process holds no activity "
+                "lease to prove otherwise); refusing to kill it. Wait for active "
+                "users to finish, then run `gpt-pro-relay close-chrome --force` "
+                "if Chrome is wedged."
+            )
+        try:
+            _kill_chrome_orphans()
+            argv = _chrome_open_argv(port)
+            subprocess.Popen(
+                ["/usr/bin/open", "-n", "-a", str(app), "--args", *argv],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if probe_cdp(port):
+                    _require_running_chrome_app(app, port)
+                    log_stage("chrome_cdp_ready", port=port)
+                    bind_chrome_compositor_surface()
+                    return True
+                time.sleep(0.3)
+            raise RuntimeError(_cdp_timeout_message(port))
+        finally:
+            lease.downgrade_shared()
 
 
 async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
@@ -1774,9 +1823,72 @@ class ChromeActivityLease(_FlockGuard):
     Kernel-released flock ownership stays correct across process crashes without
     a refcount or persistent state database.
     """
+    # The shared lease this process currently holds, if any. Every caller of
+    # `ensure_shared_chrome_running` runs inside exactly one shared lease, so a
+    # single slot is enough — and the recovery path needs to reach *this* fd
+    # rather than open a second one (see `try_upgrade_exclusive`).
+    _process_shared_lease: "ChromeActivityLease | None" = None
+
     def __init__(self, *, exclusive: bool = False, blocking: bool = True):
         super().__init__(CHROME_ACTIVITY_LOCK, blocking=blocking)
         self.exclusive = exclusive
+
+    @classmethod
+    def held_by_this_process(cls) -> "ChromeActivityLease | None":
+        """The shared lease this process holds, or None if it holds none."""
+        return cls._process_shared_lease
+
+    def try_upgrade_exclusive(self) -> bool:
+        """Convert this held shared lease to exclusive, without blocking.
+
+        True iff **no other process** is using the browser. This must convert
+        the caller's own fd: a second fd opened in this process would conflict
+        with our own `LOCK_SH` and report "someone else is here" every time,
+        including for a lone serial run — the same self-counting trap that
+        `_slots_held(skip_slot_id=...)` exists to avoid (see `8a3503d`).
+
+        Non-blocking on purpose. The caller holds `LaunchLock` here, while
+        `close-chrome` takes the activity lease *before* `LaunchLock`; a
+        blocking wait would close that cycle into a deadlock.
+
+        flock conversion is not atomic — the kernel drops the shared lock
+        before taking the exclusive one, so a failed conversion can leave the
+        fd unlocked. The failure path re-takes `LOCK_SH` non-blocking (blocking
+        would reopen the same deadlock against a `close-chrome` that slipped
+        into the gap). If even that fails the lease is genuinely lost, which is
+        still safe: the caller fails closed and unwinds, releasing everything.
+        """
+        if self._fd is None or self.exclusive:
+            return False
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                fcntl.flock(self._fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                log_stage("activity_lease_lost_on_upgrade")
+            return False
+        self.exclusive = True
+        return True
+
+    def downgrade_shared(self) -> None:
+        """Return an upgraded lease to shared so other users can enter again.
+
+        Non-blocking for the same reason as the upgrade, not merely for
+        symmetry: conversion is not atomic in this direction either, so a
+        `close-chrome` that takes the lease in the gap would then block on the
+        `LaunchLock` this caller still holds while this caller blocked on
+        `LOCK_SH` — a deadlock. Losing the lease here is the safe failure: the
+        only process that could have taken it is a shutdown that is about to
+        end this worker anyway.
+        """
+        if self._fd is None or not self.exclusive:
+            return
+        self.exclusive = False
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            log_stage("activity_lease_lost_on_downgrade")
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1793,7 +1905,14 @@ class ChromeActivityLease(_FlockGuard):
             fd.close()
             raise
         self._fd = fd
+        if not self.exclusive:
+            ChromeActivityLease._process_shared_lease = self
         return True
+
+    def release(self) -> None:
+        if ChromeActivityLease._process_shared_lease is self:
+            ChromeActivityLease._process_shared_lease = None
+        super().release()
 
 
 class RunClaim(_FlockGuard):

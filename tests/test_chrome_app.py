@@ -155,8 +155,10 @@ def test_launch_uses_validated_beta_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "probe_cdp", probe)
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", tmp_path / "chrome-activity.lock")
 
-    assert cli.ensure_shared_chrome_running() is True
+    with cli.ChromeActivityLease():
+        assert cli.ensure_shared_chrome_running() is True
     assert calls["popen"][:5] == [
         "/usr/bin/open", "-n", "-a", str(beta), "--args",
     ]
@@ -184,9 +186,11 @@ def test_post_launch_readiness_rejects_wrong_app(tmp_path, monkeypatch):
         return calls["probe"] > 3
 
     monkeypatch.setattr(cli, "probe_cdp", probe)
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", tmp_path / "chrome-activity.lock")
 
-    with pytest.raises(RuntimeError, match="does not match"):
-        cli.ensure_shared_chrome_running()
+    with cli.ChromeActivityLease():
+        with pytest.raises(RuntimeError, match="does not match"):
+            cli.ensure_shared_chrome_running()
 
 
 class _DummyLock:

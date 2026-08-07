@@ -106,6 +106,9 @@ def _wire_recovery(monkeypatch, tmp_path):
     slots = tmp_path / "slots"
     slots.mkdir(exist_ok=True)
     monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+    # Recovery also requires proving no `login`/`doctor` holds the activity
+    # lease, so the recovery path needs a real lock file to convert.
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", tmp_path / "chrome-activity.lock")
     beta = tmp_path / "Google Chrome Beta.app"
     monkeypatch.setattr(cli, "chrome_app_path", lambda: beta)
     monkeypatch.setattr(cli, "validate_chrome_app", lambda app: app)
@@ -134,8 +137,10 @@ def test_ensure_chrome_recovers_when_only_own_slot_held(tmp_path, monkeypatch):
     slots, calls = _wire_recovery(monkeypatch, tmp_path)
     fd0 = _hold(slots / "slot-0.lock")  # this worker's own slot
     try:
-        # Wedged CDP + only our own slot held → must NOT raise; must relaunch.
-        result = cli.ensure_shared_chrome_running(skip_slot_id=0)
+        # Wedged CDP, only our own slot held, and only our own activity lease →
+        # must NOT raise; must relaunch. Neither guard may count *itself*.
+        with cli.ChromeActivityLease():
+            result = cli.ensure_shared_chrome_running(skip_slot_id=0)
     finally:
         _release(fd0)
     assert result is True            # performed the launch (owner return)
@@ -148,8 +153,9 @@ def test_ensure_chrome_refuses_when_sibling_slot_held(tmp_path, monkeypatch):
     fd0 = _hold(slots / "slot-0.lock")  # own
     fd1 = _hold(slots / "slot-1.lock")  # a genuinely-active sibling
     try:
-        with pytest.raises(RuntimeError, match="other workers hold ParallelSlots"):
-            cli.ensure_shared_chrome_running(skip_slot_id=0)
+        with cli.ChromeActivityLease():
+            with pytest.raises(RuntimeError, match="other workers hold ParallelSlots"):
+                cli.ensure_shared_chrome_running(skip_slot_id=0)
     finally:
         _release(fd0, fd1)
     assert calls["kill"] == 0         # never killed Chrome out from under the sibling

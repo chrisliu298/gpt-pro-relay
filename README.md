@@ -40,20 +40,29 @@ Requires:
 
 ```bash
 brew install --cask google-chrome@beta
+open -a "Google Chrome Beta"   # once, on the Mac's own screen; approve the first-open prompt, then quit
 uv sync
-uv run gpt-pro-relay login    # opens Chrome Beta; sign in to ChatGPT manually
+uv run gpt-pro-relay login     # opens Chrome Beta; sign in to ChatGPT manually
 ```
+
+**Launch Chrome Beta once interactively before the relay ever touches it.** macOS asks for approval the first time you open freshly downloaded software, and that prompt appears on the Mac's own screen — an SSH-detached worker cannot answer it. Get it out of the way while a human is present. See [Troubleshooting](#a-newly-installed-chrome-never-binds-the-cdp-port) if the relay hangs on a new Chrome anyway.
 
 Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **GPT-5.6 Sol** + **Pro** once so the account preference is set.
 
 The default app is `/Applications/Google Chrome Beta.app`. `GPT_PRO_CHROME_APP` may select a Chrome Dev or Canary app with a recognized side-by-side bundle identity, but the relay rejects Stable Chrome's `com.google.Chrome` bundle identity instead of silently recreating the Dock conflict. Existing installations that previously used Stable should migrate while no workers are running:
 
+Migration keeps the existing `~/.gpt-pro-profile/`. Beta is a newer Chrome than Stable, so its **first launch upgrades the profile schema one-way** — back the profile up before that launch, not after, and only while Chrome is fully closed:
+
 ```bash
 gpt-pro-relay close-chrome
+cp -a ~/.gpt-pro-profile ~/.gpt-pro-profile.bak       # whole profile; do this while Chrome is closed
 brew install --cask google-chrome@beta
+open -a "Google Chrome Beta"                          # approve the first-open prompt, then quit
 uv run gpt-pro-relay login
 uv run gpt-pro-relay doctor
 ```
+
+The ChatGPT session carried over without re-authentication in the 2026-08-06 migration, so `login` may just detect the cookie and exit — but treat that as luck, not contract, and be ready to sign in again.
 
 ### Optional: bare command on PATH
 
@@ -180,6 +189,28 @@ Terminal (not auto-recovered) cases, all fail closed with a specific `reason`:
 - **Repeated closes exhausting the budget** (`page_recovery_exhausted`), or the deadline expiring mid-recovery (`status: timeout`).
 
 Whether ChatGPT resumes *live* streaming on reopen (vs. only showing the finished turn) is server-side behavior; either way the Copy-button completion gate and served-model audit still apply, so the worst case is a clean timeout, never a wrong or partial answer.
+
+## Troubleshooting
+
+### A newly installed Chrome never binds the CDP port
+
+Symptom: `Chrome CDP not ready on port 19222 after 30s`, on a Chrome app the relay has never successfully launched before. The Chrome process **exists** with the correct argv but never listens.
+
+Confirm it is a pre-execution hold rather than a Chrome problem — all of these were measured on 2026-08-06:
+
+```bash
+ps -o pid,stat,rss,etime -p <pid>     # alive, ~32K RSS, 0% CPU, not progressing
+sample <pid> 2                        # one frame: _dyld_start
+vmmap <pid> | head                    # only the main executable and dyld mapped — no libraries
+# cheap discriminator: another binary in the same bundle hangs identically
+"/Applications/Google Chrome Beta.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/<ver>/Helpers/chrome_crashpad_handler" --help
+```
+
+Blocked before linking, and bundle-wide rather than Chrome-specific, means macOS is refusing to execute the bundle — most likely the first-open approval macOS requires for downloaded software, which only a human at the Mac can grant. Two signals look reassuring and are not evidence against this: `spctl -a` reports `accepted` and `codesign -v` reports `valid on disk`. Both speak to signing policy, not to pending first-open consent. The unified log is silent.
+
+Fix: open the app once from the Mac's own screen and approve the prompt (or **Open Anyway** in System Settings → Privacy & Security), then relaunch the relay.
+
+What is *not* established: in the one observed incident, `xattr -dr com.apple.quarantine` alone did **not** release the process, while a broader `xattr -cr` (which also removed `com.apple.FinderInfo`) coincided with success — but a human approval click landed in the same window, so the two were never isolated. Do not treat `xattr -cr` as the known remedy. It clears *every* attribute on *every* bundle member, which is a wider security bypass than the problem calls for. Prefer the interactive approval; reach for attribute clearing only as a deliberate, trusted-source last resort.
 
 ## Known limitations
 - Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
