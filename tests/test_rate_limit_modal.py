@@ -1,24 +1,41 @@
-"""Auto-dismissal of the "Too many requests" conversation-history rate-limit modal.
+"""Auto-dismissal of the blocking full-viewport modals ChatGPT renders over the composer.
 
-During a parallel burst ChatGPT throttles the sidebar conversation-list endpoint
-(`/backend-api/conversations` → 429) and renders a full-viewport `fixed inset-0
-z-50` modal (`data-testid=modal-conversation-history-rate-limit`, dismiss button
-"Got it"). Its `pointer-events: auto` backdrop makes the composer un-clickable,
-so a worker that reaches `composer.click()` while it is up hangs the full 30s
-actionability timeout and dies `worker_exception` (observed 2026-07-19, 2 runs).
+Two distinct modals, same blast radius. Both mount a `fixed inset-0 z-50`
+overlay with `pointer-events: auto`, which makes the composer/send button
+un-clickable, so a worker that reaches a click while one is up hangs the full 30s
+actionability timeout and dies `worker_exception`:
 
-`_install_rate_limit_dismisser` registers a Playwright locator handler that
-clicks "Got it" before the actionability checks of every downstream click. These
-pin: the handler is registered against the right modal, clicking targets the
-"Got it" button and emits the observability stage, and a registration failure
-(fake page in tests, or a selector rename in prod) never aborts the run — it is a
-UI-overlay cleaner, not rate-limit backoff.
+  - **"Too many requests"** (`data-testid=modal-conversation-history-rate-limit`,
+    dismiss button "Got it"). A parallel burst throttles the sidebar
+    conversation-list endpoint (`/backend-api/conversations` → 429). Observed
+    2026-07-19, 2 runs.
+  - **The product-announcement "beacon"** (`data-testid=modal-beacon`, dismissed
+    via its own `data-testid=close-button`). Observed 2026-08-08, run
+    `ask-20260808T010319Z-d6177828` died on the *send* click — past paste and
+    both chip verifications — against "You now have access to Health in
+    ChatGPT". The rate-limit handler is inert against it (different test-id),
+    which is exactly why each modal needs its own handler.
+
+`_install_modal_dismissers` registers a Playwright locator handler per modal,
+which fires before the actionability checks of every downstream click. These pin:
+each handler is registered against the right trigger, clicking targets the
+dismiss affordance (never a modal's primary CTA) and emits the observability
+stage, both are installed together so a recovery site cannot get only one, and a
+registration failure (fake page in tests, or a selector rename in prod) never
+aborts the run — these are UI-overlay cleaners, not rate-limit backoff.
 """
 
 import pytest
 
 from gpt_pro import cli
-from gpt_pro.cli import RATE_LIMIT_MODAL_TESTID, _install_rate_limit_dismisser
+from gpt_pro.cli import (
+    BEACON_MODAL_CLOSE_TESTID,
+    BEACON_MODAL_TESTID,
+    RATE_LIMIT_MODAL_TESTID,
+    _install_beacon_modal_dismisser,
+    _install_modal_dismissers,
+    _install_rate_limit_dismisser,
+)
 
 
 class _FakeButton:
@@ -39,15 +56,35 @@ class _FakeModalLocator:
         self._rec["name"] = name
         return _FakeButton(self._rec)
 
+    def get_by_test_id(self, testid):
+        # Nested scoping (beacon container → its own close button). Recorded
+        # separately from the page-level chain so a test can prove the close
+        # button is resolved *inside* the beacon rather than page-wide.
+        self._rec.setdefault("nested_testids", []).append(testid)
+        return _FakeModalLocator(self._rec)
+
+    @property
+    def first(self):
+        self._rec["first"] = True
+        return self
+
+    async def click(self, timeout=None):
+        self._rec["clicked"] = True
+        self._rec["timeout"] = timeout
+
 
 class _FakePage:
     """Records handler registration + the button the handler resolves."""
 
     def __init__(self, *, raise_on_register=False):
-        self.registered = None  # (trigger_locator, handler)
+        self.handlers = []  # [(trigger_locator, handler)], in registration order
         self.testids = []
         self.rec = {}
         self._raise = raise_on_register
+
+    @property
+    def registered(self):
+        return self.handlers[-1] if self.handlers else None
 
     def get_by_test_id(self, testid):
         self.testids.append(testid)
@@ -56,7 +93,7 @@ class _FakePage:
     async def add_locator_handler(self, locator, handler, **_kw):
         if self._raise:
             raise RuntimeError("no locator-handler support")
-        self.registered = (locator, handler)
+        self.handlers.append((locator, handler))
 
 
 @pytest.fixture
@@ -84,6 +121,68 @@ async def test_handler_clicks_got_it_and_logs(_stages):
     assert page.rec.get("name") == "Got it"
     assert page.rec.get("timeout") == 5000
     assert ("rate_limit_modal_dismissed", {}) in _stages
+
+
+# ---- the product-announcement beacon modal ----
+
+
+async def test_beacon_handler_triggers_on_the_close_button_not_the_container(_stages):
+    page = _FakePage()
+    await _install_beacon_modal_dismisser(page)
+    assert page.registered is not None
+    # Scoped: the close button is resolved *inside* the beacon container, so a
+    # same-test-id close button belonging to some other dialog is out of reach.
+    assert page.testids == [BEACON_MODAL_TESTID]
+    assert page.rec.get("nested_testids") == [BEACON_MODAL_CLOSE_TESTID]
+    # `.first` is a strict-mode guard: a second match must not raise *inside* the
+    # handler, because a locator-handler exception propagates into whatever
+    # action triggered it — turning a fail-open cleaner into a send failure.
+    assert page.rec.get("first") is True
+
+
+async def test_beacon_handler_clicks_close_and_logs(_stages):
+    page = _FakePage()
+    await _install_beacon_modal_dismisser(page)
+    _locator, handler = page.registered
+    await handler()
+    assert page.rec.get("clicked") is True
+    assert page.rec.get("timeout") == 5000
+    # The handler clicks the very element that triggered it — it does not build a
+    # second locator (which could resolve a *different* button than the one
+    # Playwright verified as visible).
+    assert page.rec.get("nested_testids") == [BEACON_MODAL_CLOSE_TESTID]
+    # Never the modal's primary CTA. "Get started" opts the account into the
+    # announced feature; dismissal must be inert.
+    assert page.rec.get("name") is None
+    assert ("beacon_modal_dismissed", {}) in _stages
+
+
+async def test_beacon_registration_failure_never_aborts_the_run(_stages):
+    page = _FakePage(raise_on_register=True)
+    await _install_beacon_modal_dismisser(page)  # must not raise
+    assert page.handlers == []
+    assert any(s == "beacon_dismisser_install_skipped" for s, _ in _stages)
+
+
+# ---- both dismissers install together ----
+
+
+async def test_install_modal_dismissers_registers_both(_stages):
+    # Single entry point so a future page-recovery site cannot pick up one
+    # dismisser and silently miss the other.
+    page = _FakePage()
+    await _install_modal_dismissers(page)
+    assert len(page.handlers) == 2
+    assert page.testids == [RATE_LIMIT_MODAL_TESTID, BEACON_MODAL_TESTID]
+
+
+async def test_install_modal_dismissers_survives_a_failing_registration(_stages):
+    page = _FakePage(raise_on_register=True)
+    await _install_modal_dismissers(page)  # must not raise
+    skipped = {s for s, _ in _stages}
+    assert "rate_limit_dismisser_install_skipped" in skipped
+    # Both are attempted: the first one failing must not skip the second.
+    assert "beacon_dismisser_install_skipped" in skipped
 
 
 # ---- _focus_and_paste is locator-bound (the dismisser's focus guarantee) ----

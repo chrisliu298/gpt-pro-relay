@@ -30,6 +30,15 @@ SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 # pointer-events backdrop never hangs a composer/send click. See
 # _install_rate_limit_dismisser.
 RATE_LIMIT_MODAL_TESTID = "modal-conversation-history-rate-limit"
+# ChatGPT's product-announcement "beacon" modal — a *second*, unrelated modal
+# with the same blocking mechanics (2026-08-08: "You now have access to Health in
+# ChatGPT" killed run ask-20260808T010319Z-d6177828 on the send click). Different
+# test-id, so the rate-limit handler is inert against it; it needs its own.
+# Dismissed via the dialog's own close affordance, NEVER its primary CTA ("Get
+# started"), which would opt the account into the announced feature. See
+# _install_beacon_modal_dismisser.
+BEACON_MODAL_TESTID = "modal-beacon"
+BEACON_MODAL_CLOSE_TESTID = "close-button"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
@@ -2142,6 +2151,89 @@ async def _install_rate_limit_dismisser(page) -> None:
         log_stage("rate_limit_dismisser_install_skipped", exception=f"{type(e).__name__}: {e}")
 
 
+async def _install_beacon_modal_dismisser(page) -> None:
+    """Auto-dismiss ChatGPT's product-announcement "beacon" modal.
+
+    A second modal class with the *same* blast radius as the rate-limit one but a
+    different test-id, so that handler is inert against it. On 2026-08-08 run
+    `ask-20260808T010319Z-d6177828` died `worker_exception` on the **send** click
+    — past paste and both chip verifications, one step from submitting — after
+    "You now have access to Health in ChatGPT" mounted its `fixed inset-0 z-50`
+    `pointer-events: auto` overlay inside `#modal-beacon`. Rare (1 run in ~3400)
+    but it burns a fully-prepared run, and unlike the rate-limit modal it is not
+    self-inflicted by parallelism — lowering GPT_PRO_MAX_PARALLEL does nothing.
+
+    Two deliberate choices:
+
+      - **The trigger is the close BUTTON, not the `#modal-beacon` container.**
+        The container is the announcement mount point and can be present without
+        (or before) a rendered dialog; a handler keyed on it would fire with no
+        button to click, and an exception raised *inside* a locator handler
+        propagates into the triggering action — converting a fail-open cleaner
+        into a send-path failure, the exact outcome it exists to prevent. Keying
+        on the button makes the trigger and the affordance the same element, so
+        the handler can only fire when the thing it clicks is there. `.first` is
+        a strict-mode guard and nothing more (a second match must not raise
+        inside the handler); the capture shows one `#modal-beacon` and one
+        close button page-wide, so it selects nothing in practice.
+      - **Close, never the CTA.** The dialog's primary button ("Get started")
+        also dismisses it, but it navigates/opts in. Scoping the close button
+        *inside* the beacon likewise keeps a same-test-id button in some other
+        dialog out of reach.
+
+    Fail-open on both drift modes, exactly as `_install_rate_limit_dismisser`: a
+    test-id rename does not raise (locators are lazy) and simply leaves the
+    handler inert — reverting to the pre-fix behavior, which is a rare stall, not
+    a regression; a genuine `add_locator_handler` API/channel failure is
+    swallowed to `beacon_dismisser_install_skipped`. Neither aborts the send.
+
+    **Known limit, inherited from the rate-limit handler and NOT fixed here: a
+    dismiss click that is itself obstructed aborts the triggering action.** If
+    something covers the close button, `click` raises inside the handler,
+    Playwright propagates that into whatever action triggered it, and the error
+    then resurfaces on subsequent page calls (measured against real Playwright,
+    2026-08-09) — a 5s failure instead of the pre-fix 30s stall. The obvious
+    trigger would be the rate-limit modal and a beacon stacking, which has never
+    been observed (the 2026-08-08 beacon run logged no rate-limit dismissal) and
+    which synthetic fixtures could not reproduce faithfully enough to trust. The
+    best-effort alternative — swallow the click failure plus `no_wait_after` —
+    was prototyped and measured to spin the handler dozens of times without
+    landing the send, i.e. it converts an abort into the same stall while adding
+    a second way for the two handlers to fight. Left alone deliberately: this
+    mirrors a pattern with 18 live dismissals behind it. If a run ever dies with
+    `Page._on_locator_handler_triggered` in `result.json`, this is the note.
+    """
+    try:
+        # Built inside the try with the registration: real Playwright locators
+        # are lazy and never raise here, but "never aborts the send" must hold
+        # structurally, not by trusting that. A chained locator has more surface
+        # (two resolutions + `.first`) than the rate-limit one-liner.
+        close_btn = (
+            page.get_by_test_id(BEACON_MODAL_TESTID).get_by_test_id(BEACON_MODAL_CLOSE_TESTID).first
+        )
+
+        async def _dismiss() -> None:
+            await close_btn.click(timeout=5000)
+            log_stage("beacon_modal_dismissed")
+
+        await page.add_locator_handler(close_btn, _dismiss)
+    except Exception as e:
+        log_stage("beacon_dismisser_install_skipped", exception=f"{type(e).__name__}: {e}")
+
+
+async def _install_modal_dismissers(page) -> None:
+    """Install every blocking-overlay dismisser on `page`.
+
+    One entry point on purpose: both the initial tab and every page-recovery
+    replacement tab need the full set, and a site that picks up one dismisser but
+    misses the other reintroduces the stall for whichever modal it dropped. Each
+    install is independently fail-open, so a failure in one still installs the
+    rest.
+    """
+    await _install_rate_limit_dismisser(page)
+    await _install_beacon_modal_dismisser(page)
+
+
 async def read_latest_assistant_text(page) -> str:
     """Latest assistant turn's innerText, or "" on a *live-page* transient read
     failure. Raises RunPageClosed if the tab was closed — so the monitor loop
@@ -2573,7 +2665,7 @@ async def _run_postsend(ctx, page, *, run_dir, run_id, deadline, send_ts, conv, 
                               exception=f"{type(e).__name__}: {e}")
                     return err("browser_disconnected_after_send", {"conversation_url": conv_url}), page
                 _attach_response_logger(page, network_log)
-                await _install_rate_limit_dismisser(page)
+                await _install_modal_dismissers(page)
                 nav_reason = await _recover_navigate(ctx, page, conv_url, deadline=deadline)
                 if nav_reason == "closed":
                     # Reopened tab closed during nav — re-classify (inner loop),
@@ -2612,11 +2704,12 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
             # background tabs in a windowed Chrome.
             try:
                 _attach_response_logger(page, network_log)
-                # Register before goto so the "Too many requests" modal is
-                # auto-dismissed ahead of every downstream click (chip-menu,
-                # composer, send, Copy) — the burst throttle can render it as
-                # early as the first conversation-list fetch on page load.
-                await _install_rate_limit_dismisser(page)
+                # Register before goto so a blocking modal ("Too many requests",
+                # a product-announcement beacon) is auto-dismissed ahead of every
+                # downstream click (chip-menu, composer, send, Copy) — the burst
+                # throttle can render one as early as the first conversation-list
+                # fetch on page load, and a beacon mounts on first paint.
+                await _install_modal_dismissers(page)
                 log_stage("chrome_connected")
 
                 # Early dequeue: a stop that arrived while queued (or during the

@@ -1128,16 +1128,18 @@ class _FakeCtx:
 def _postsend_env(monkeypatch):
     monkeypatch.setattr(cli, "_attach_response_logger", lambda _p, _n: None)
 
-    # Record every page the rate-limit dismisser is installed on so recovery
-    # tests can assert each reopened tab is re-protected (like the response
-    # logger), not just the initial one.
+    # Record every page the modal dismissers are installed on so recovery tests
+    # can assert each reopened tab is re-protected (like the response logger),
+    # not just the initial one. Stubbing the single entry point is deliberate: it
+    # is what the recovery path calls, so a future dismisser added there is
+    # covered by these assertions for free.
     installs = []
 
     async def _record_install(page):
         installs.append(page)
 
-    monkeypatch.setattr(cli, "_install_rate_limit_dismisser", _record_install)
-    monkeypatch.rate_limit_installs = installs
+    monkeypatch.setattr(cli, "_install_modal_dismissers", _record_install)
+    monkeypatch.modal_dismisser_installs = installs
     return monkeypatch
 
 
@@ -1185,7 +1187,7 @@ async def test_postsend_recovers_once_returns_new_page(_postsend_env, tmp_path):
     assert ctx.new_page_calls == 1
     assert page is p1                  # returns the LATEST owned page for cleanup
     assert monitor.calls == [p0, p1]   # re-finalized on the reopened tab
-    assert p1 in _postsend_env.rate_limit_installs  # dismisser re-installed on the reopened tab
+    assert p1 in _postsend_env.modal_dismisser_installs  # re-installed on the reopened tab
 
 
 async def test_postsend_no_url_terminal_no_reopen(_postsend_env, tmp_path):
