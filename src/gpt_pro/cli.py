@@ -2155,13 +2155,26 @@ async def _install_beacon_modal_dismisser(page) -> None:
     """Auto-dismiss ChatGPT's product-announcement "beacon" modal.
 
     A second modal class with the *same* blast radius as the rate-limit one but a
-    different test-id, so that handler is inert against it. On 2026-08-08 run
-    `ask-20260808T010319Z-d6177828` died `worker_exception` on the **send** click
-    — past paste and both chip verifications, one step from submitting — after
-    "You now have access to Health in ChatGPT" mounted its `fixed inset-0 z-50`
-    `pointer-events: auto` overlay inside `#modal-beacon`. Rare (1 run in ~3400)
-    but it burns a fully-prepared run, and unlike the rate-limit modal it is not
-    self-inflicted by parallelism — lowering GPT_PRO_MAX_PARALLEL does nothing.
+    different test-id, so that handler is inert against it. **Two** runs died with
+    an open "You now have access to Health in ChatGPT" beacon (`data-state="open"`
+    inside `#modal-beacon`) in their captured `error.html`:
+
+      - `ask-20260808T010319Z-d6177828` — on the **send** click, past paste and
+        both chip verifications, one step from submitting. Its call log names the
+        beacon subtree as the pointer-event interceptor, so causation is explicit.
+      - `ask-20260801T000235Z-00f583c6` — earlier, on the composer click, whose
+        log is the bare `Locator.click … waiting for get_by_role("textbox").first`
+        with no interception line. That is the *same* uninformative signature
+        CLAUDE.md already records for the 2026-07-19 rate-limit deaths — root
+        cause visible only in `error.html` — so read it as the same failure class,
+        not as an independently proven one.
+
+    Both fall inside the window the Health announcement has existed: 2 of the 678
+    runs since 2026-08-01, not 2 of the ~3400-run archive. Rare either way, but it
+    burns a fully-prepared run, and unlike the rate-limit modal it is not
+    self-inflicted by parallelism — lowering GPT_PRO_MAX_PARALLEL does nothing
+    (the 08-08 run was in a burst whose sibling 2s later finished `ok`, and no
+    rate-limit modal was in its DOM at all).
 
     Two deliberate choices:
 
@@ -2174,8 +2187,14 @@ async def _install_beacon_modal_dismisser(page) -> None:
         on the button makes the trigger and the affordance the same element, so
         the handler can only fire when the thing it clicks is there. `.first` is
         a strict-mode guard and nothing more (a second match must not raise
-        inside the handler); the capture shows one `#modal-beacon` and one
-        close button page-wide, so it selects nothing in practice.
+        inside the handler); both captures show one `#modal-beacon` and one
+        close button page-wide, so it selects nothing in practice. Its untested
+        edge, flagged by review and left as-is: if Radix ever leaves a *stale*
+        close button mounted ahead of the live one — the exit-animation pattern
+        the chip-submenu note warns about — `.first` resolves the stale node and
+        the handler goes inert (fail-open, a stall) or waits on a node that never
+        hides. Neither capture shows that state; if one ever does, resolve by
+        ownership as `_open_chip_submenu` does rather than swapping in `.last`.
       - **Close, never the CTA.** The dialog's primary button ("Get started")
         also dismisses it, but it navigates/opts in. Scoping the close button
         *inside* the beacon likewise keeps a same-test-id button in some other
@@ -2200,8 +2219,21 @@ async def _install_beacon_modal_dismisser(page) -> None:
     was prototyped and measured to spin the handler dozens of times without
     landing the send, i.e. it converts an abort into the same stall while adding
     a second way for the two handlers to fight. Left alone deliberately: this
-    mirrors a pattern with 18 live dismissals behind it. If a run ever dies with
-    `Page._on_locator_handler_triggered` in `result.json`, this is the note.
+    mirrors a pattern with 20 live dismissals across 18 runs behind it and zero
+    install skips. If a run ever dies with `Page._on_locator_handler_triggered`
+    in `result.json`, this is the note.
+
+    **The candidate fix if stacking ever is observed** (from the 2026-08-09 GPT
+    review, prototyped by it in a real stacked-overlay fixture, NOT adopted here):
+    dismiss via `locator.dispatch_event("click")` — either outright or as a
+    narrowly-caught fallback after an obstruction timeout. Event dispatch skips
+    pointer hit-testing, so it reaches a covered Close/"Got it" button while still
+    targeting the scoped element (never the CTA) and never resubmitting. In the
+    fixture it cleared both overlays and let the original click land. Do not adopt
+    it on that synthetic proof alone: verify ChatGPT's React handler responds to a
+    dispatched event identically to a real click, and keep the failure re-raising
+    rather than swallowed. Handlers run one at a time in registration order
+    (rate-limit, then beacon), so ordering — not concurrency — is the axis here.
     """
     try:
         # Built inside the try with the registration: real Playwright locators
