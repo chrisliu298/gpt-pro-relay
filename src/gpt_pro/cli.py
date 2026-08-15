@@ -41,7 +41,12 @@ BEACON_MODAL_TESTID = "modal-beacon"
 BEACON_MODAL_CLOSE_TESTID = "close-button"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
-DEFAULT_GENERATION_TIMEOUT = 60 * 60
+# Generations are allowed to finish naturally.  ``float("inf")`` preserves the
+# existing deadline-based control flow (including finite-deadline unit tests)
+# without imposing a production wall-clock cap.  Short operation-specific
+# timeouts and the explicit ``stop`` command still bound broken interactions and
+# provide manual cancellation.
+DEFAULT_GENERATION_TIMEOUT = float("inf")
 DEFAULT_MAX_PARALLEL = 6
 MAX_PROMPT_BYTES = 5_000_000
 # Initial chatgpt.com navigation. Playwright's implicit 30s default clipped
@@ -56,24 +61,37 @@ DEFAULT_GOTO_RETRIES = 1
 # mid-run, the worker reopens the *same* captured conversation URL in a fresh tab
 # and resumes monitoring — never re-pasting or re-sending (a resend burns another
 # 5-20 min of Pro reasoning). Bounded so a repeatedly-closed window can't loop
-# forever; every recovery await is capped by the ORIGINAL generation deadline, so
-# recovery never grants a fresh budget. 3 tolerates an accidental repeated close;
-# it is safe only because all recovery awaits are deadline-bounded. See
+# forever. Individual recovery operations retain their own finite timeouts. 3
+# tolerates an accidental repeated close without imposing an overall generation
+# deadline. See
 # _monitor_and_finalize / _recover_navigate / classify_recovery.
 MAX_PAGE_RECOVERIES = 3
 # The latest assistant text must sit unchanged this long before the completion
 # gate even *checks* for the no-Stop-button + Copy-button-present signals. Named
 # so tests can drive completion without waiting the wall-clock interval.
 COMPLETION_STABLE_SECS = 5.0
+# When ChatGPT converts a large native paste into a ``Pasted markdown`` file,
+# the contenteditable becomes empty: the entire task exists only inside an
+# attachment.  Recent backend behavior no longer reliably treats instructions
+# inside that file as the user turn.  This short ordinary message restores the
+# instruction/document boundary without duplicating the potentially-megabyte
+# prompt or depending on ChatGPT's changing paste threshold.
+ATTACHED_PROMPT_EXECUTION_INSTRUCTION = (
+    "Execute the task specified in the attached prompt now. Treat its leading "
+    "task instructions as the user's request and any included-file sections as "
+    "supporting context. Return the completed final deliverable in this response; "
+    "do not merely acknowledge or summarize the attachment, ask for confirmation, "
+    "or offer to continue later."
+)
 # Bounded window in which the send must be confirmed to have actually landed
 # (URL -> /c/<id>, a user turn, or a Stop button). A silent no-op Send — the
 # click returned but ChatGPT never submitted (an attachment upload still
 # finalizing, a parallel-burst race) — leaves the composer full and the URL on
 # `/`, which is indistinguishable to the monitor loop from a Pro model thinking
-# silently, so the worker would otherwise burn the whole generation deadline on
-# a dead page (observed 2026-07-18: 2 of a 4-way burst no-op'd, ~60 min each).
+# silently, so an uncapped worker would otherwise monitor a dead page forever
+# (before the cap was removed, two observed burst no-ops each wasted ~60 min).
 # Generous vs the ~2s real landing so a lagging URL capture never false-fails a
-# good send; still ~180x under the 60-min waste it replaces.
+# good send, while still terminating a proven no-op promptly.
 SEND_LANDING_TIMEOUT = 20.0
 # The only URL shape recovery will reopen: a canonical ChatGPT conversation route.
 # Matched exactly (not a prefix) and stripped of query/fragment so a benign
@@ -602,8 +620,8 @@ STOP_REQUEST = "stop.request"
 def publish_response(run_dir: Path, final_name: str) -> None:
     """Rename the staged extraction to the name its outcome earns.
 
-    `response.md` must mean exactly one thing — a verified, completion-gated
-    answer — because a run's text is not self-describing: a wrong-model turn is
+    `response.md` must mean exactly one thing — a completion-gated answer whose
+    audit was not fatal — because a run's text is not self-describing: a wrong-model turn is
     complete and plausible, and a turn that missed the Copy-button gate can be
     fully rendered. Both differ from a real answer only by provenance, so the
     name is the only signal a caller reading the run_dir actually gets. Every
@@ -731,6 +749,16 @@ class RunPageClosed(Exception):
     """
 
 
+class InstructionBoundaryLost(Exception):
+    """The pasted task became attachment-only and a top-level instruction could
+    not be proven before Send.
+
+    This is a pre-send, no-quota failure.  It is distinct from a generic browser
+    exception because blindly continuing would submit a structurally ambiguous
+    turn that ChatGPT may merely acknowledge instead of execute.
+    """
+
+
 def parse_conversation_url(url: str | None) -> str | None:
     """Return the canonical `https://chatgpt.com/c/<id>` form of `url`, or None.
 
@@ -800,8 +828,8 @@ def classify_recovery(conv_url: str | None, recoveries: int, max_recoveries: int
     - "no_url"    — no validated conversation URL was captured → terminate,
                     never guess a conversation. (Message may have been sent; we
                     fail closed rather than resubmit.)
-    - "deadline"  — the original generation budget is spent → return a timeout,
-                    never a fresh budget.
+    - "deadline"  — a finite injected generation budget is spent → return a
+                    timeout, never a fresh budget. Production is unbounded.
     - "exhausted" — the bounded recovery count is used up → terminate.
     - "recover"   — reopen the captured conversation on a fresh tab.
 
@@ -1656,6 +1684,71 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
                     pass
 
 
+def _visible_composer_text(text: str | None) -> str:
+    """Remove whitespace and invisible editor sentinels from composer text."""
+    return re.sub(r"[\s\u200b\u200c\u200d\ufeff]+", "", text or "")
+
+
+async def _ensure_top_level_instruction(composer, *, prompt_chars: int) -> bool:
+    """Restore an explicit user instruction after a large paste becomes a file.
+
+    Returns ``True`` when the attachment-only boundary was observed and repaired,
+    or ``False`` when the original prompt remained inline.  Any inability to read,
+    write, and then prove a non-empty top-level message fails closed before Send.
+    """
+    try:
+        if _visible_composer_text(await composer.inner_text()):
+            return False
+        await composer.fill(ATTACHED_PROMPT_EXECUTION_INSTRUCTION)
+        if not _visible_composer_text(await composer.inner_text()):
+            raise InstructionBoundaryLost("top-level instruction did not persist")
+    except InstructionBoundaryLost:
+        raise
+    except Exception as e:
+        raise InstructionBoundaryLost(
+            f"could not verify top-level instruction: {type(e).__name__}: {e}"
+        ) from e
+    log_stage("instruction_boundary_restored", prompt_chars=prompt_chars)
+    return True
+
+
+def looks_like_instruction_boundary_failure(response: str) -> bool:
+    """Detect a short attachment acknowledgement/plan instead of task output.
+
+    This deliberately requires both an attachment-receipt/read signal and a
+    request-or-future-work signal.  The caller additionally scopes it to turns
+    where the relay observed an attachment-only paste, limiting false positives
+    for intentionally terse inline tasks.
+    """
+    normalized = " ".join((response or "").split()).lower()
+    if not normalized or len(normalized) > 3_500:
+        return False
+
+    attachment_ack = any(signal in normalized for signal in (
+        "received the attached", "received your attached", "received the file",
+        "file received", "attachment received", "read the attached",
+        "read your attached", "read the uploaded", "loaded the attached",
+        "loaded the file", "reviewed the uploaded file and understand",
+        "reviewed the attached prompt and understand",
+        "已收到附件", "附件已收到", "已收到文件", "文件已收到",
+        "已读取附件", "已读完附件", "已读取你上传", "已读取您上传",
+        "已阅读附件", "已经读取附件", "已经阅读附件", "读取了附件",
+        "阅读了附件",
+    ))
+    deferred_work = any(signal in normalized for signal in (
+        "tell me what", "tell me the task", "let me know what",
+        "what task", "what would you like", "would you like me",
+        "provide the next", "send the next", "i will continue",
+        "i'll continue", "i can continue", "i will proceed",
+        "i'll proceed", "ready to continue", "ask for confirmation",
+        "请告诉", "请说明", "请直接发送", "请给出", "下一步指令",
+        "我会继续", "我将继续", "可以继续", "如果你希望", "如果您希望",
+        "如果你的意图", "如果您的意图", "我会基于", "如需我", "再给出",
+        "另行给出", "后给出完整", "开始完整",
+    ))
+    return attachment_ack and deferred_work
+
+
 async def served_assistant_model_slug(page) -> str | None:
     """Read the latest assistant turn's `data-message-model-slug`.
 
@@ -2340,12 +2433,9 @@ async def _confirm_send_landed(page, conv, *, deadline: float, poll: float = 0.5
 
     The cheap `conv.get()` fast path is checked first, and the cutoff BEFORE any
     DOM read, so a preset conversation (a recovery re-entry) returns instantly and
-    an exhausted budget returns without touching the page or overrunning the
-    absolute `deadline`. `cutoff = min(now + SEND_LANDING_TIMEOUT, deadline)` and
-    the poll sleep is clamped to what remains, so the gate never grants a fresh
-    budget. Like the monitor loop's own `read_latest_assistant_text`, the DOM
-    probes are immediate `.count()` reads left unbounded — a wedged CDP session
-    self-corrects because the deadline is never reset. The signals are ORed and
+    an exhausted finite test budget returns without touching the page. Production
+    passes an infinite deadline, leaving `SEND_LANDING_TIMEOUT` as the effective
+    cutoff. The poll sleep is clamped to what remains. The signals are ORed and
     bias toward 'landed' (a live-page Stop-read error yields the conservative
     sentinel 1, which is treated as landed) — a false 'landed' only reverts to the
     old monitor-then-timeout, whereas a false 'not-landed' would waste a fresh Pro
@@ -2371,18 +2461,19 @@ async def _recover_navigate(ctx, page, conv_url: str, *, deadline: float) -> str
     success, or a failure-reason string:
 
     - "closed"       — the replacement tab was itself closed mid-recovery.
-    - "deadline"     — the original generation budget ran out (→ caller returns a
-                       timeout, never a fresh budget).
+    - "deadline"     — a finite injected generation budget ran out (→ caller
+                       returns a timeout). Production is unbounded.
     - "nav_timeout" / "nav_error" — navigation failed on a live tab.
     - "redirect"     — landed somewhere that is not the SAME conversation.
     - "auth_lost"    — session dropped (a login redirect can briefly keep /c/<id>).
     - "shell_missing"— the conversation DOM never rendered a message turn; feeding
-                       that empty page into the monitor would just spin to the
-                       deadline, so fail closed instead.
+                       that empty page into the monitor would spin indefinitely,
+                       so fail closed instead.
 
     Safe to retry: this is a GET of an existing conversation, never a submission.
-    Every await is capped by the remaining deadline so recovery cannot extend the
-    generation budget.
+    Every await has a finite operation timeout. A finite injected deadline can
+    shorten those caps; production's infinite deadline leaves the local caps in
+    force without limiting total generation time.
     """
     loop = asyncio.get_running_loop()
     remaining = deadline - loop.time()
@@ -2442,14 +2533,17 @@ async def _recover_navigate(ctx, page, conv_url: str, *, deadline: float) -> str
     return None
 
 
-async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, conv, err) -> dict:
+async def _monitor_and_finalize(
+    page, *, run_dir, run_id, deadline, send_ts, conv, err,
+    instruction_boundary_restored=False,
+) -> dict:
     """Post-send monitor + finalize on `page`. Returns a terminal result dict, or
     raises RunPageClosed if the tab closes (the recovery loop reopens + retries).
 
     Receives NO prompt text, composer, or Send handle: it is *structurally*
-    incapable of re-pasting or re-sending. The absolute `deadline` is passed in
-    and never reset, so re-running this after a recovery keeps the original
-    generation budget. Re-running after completion is idempotent — the completed
+    incapable of re-pasting or re-sending. Production passes an infinite
+    `deadline`; finite values remain supported for deterministic timeout and
+    recovery tests. Re-running after completion is idempotent — the completed
     turn re-detects immediately (Copy button present) and response.md is
     overwritten atomically.
     """
@@ -2459,7 +2553,7 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
     # but ChatGPT never submitted: an attachment upload still finalizing, a
     # parallel-burst race). That leaves the composer full and the URL on `/`,
     # which the monitor loop below cannot tell apart from a Pro model thinking
-    # silently, so it would spin to the full generation deadline on a dead page.
+    # silently, so an uncapped worker would monitor a dead page forever.
     # Confirm the send landed within a bounded window; fail closed otherwise —
     # NO resubmit (auto-retry is rejected: it burns 5-20 min of Pro reasoning),
     # just surface the run_dir and let the caller decide. On a recovery re-entry
@@ -2619,6 +2713,22 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
     if completed and model_audit != "verified":
         log_stage("served_model_unverified", model_audit=model_audit)
 
+    # A completion-gated response can still be the backend's final answer to the
+    # wrong *shape* of user turn: "file received; tell me what to do".  Only run
+    # this semantic guard when we positively observed an attachment-only paste;
+    # preserve inline tasks that intentionally request a terse acknowledgement.
+    # Model provenance outranks this check, so wrong-model bodies remain under
+    # response.rejected.md rather than being reclassified here.
+    if (completed and instruction_boundary_restored
+            and looks_like_instruction_boundary_failure(response)):
+        publish_response(run_dir, "response.incomplete.md")
+        await safe_screenshot(page, run_dir / "error-instruction_boundary_lost.png")
+        log_stage("error", reason="instruction_boundary_lost",
+                  response_chars=len(response))
+        return err("instruction_boundary_lost",
+                   {"completed": True, "response_chars": len(response),
+                    "model_audit": model_audit})
+
     # Publish under the name this outcome earns. `completed` is exactly the
     # `status: ok` condition (a fatal audit already returned), and it is the
     # Copy-button gate — so a turn that missed it is `response.partial.md` even
@@ -2640,17 +2750,20 @@ async def _monitor_and_finalize(page, *, run_dir, run_id, deadline, send_ts, con
     return result
 
 
-async def _run_postsend(ctx, page, *, run_dir, run_id, deadline, send_ts, conv, network_log, err) -> tuple[dict, object]:
+async def _run_postsend(
+    ctx, page, *, run_dir, run_id, deadline, send_ts, conv, network_log, err,
+    instruction_boundary_restored=False,
+) -> tuple[dict, object]:
     """Drive `_monitor_and_finalize` with bounded page-close recovery.
 
     Returns `(result, latest_owned_page)`. The caller MUST close the returned
     page (not its original handle): recovery rebinds to fresh tabs, so the
     returned page is the only one still owned — closing it keeps the existing
     bounded `finally` leak-safe. Receives NO prompt/composer/send handle, so it
-    is structurally incapable of re-pasting or re-sending; the original absolute
-    `deadline` is threaded through unchanged (recovery never grants a fresh
-    budget). Extracted from `_run_with_browser` so the recovery control flow —
-    budget accounting, rebind, terminal reasons — is unit-testable with fakes.
+    is structurally incapable of re-pasting or re-sending. Production threads an
+    infinite `deadline` through unchanged; finite values keep timeout accounting
+    unit-testable with fakes. Extracted from `_run_with_browser` so the recovery
+    control flow — rebind and terminal reasons — is independently testable.
     """
     loop = asyncio.get_running_loop()
     recoveries = 0
@@ -2665,6 +2778,7 @@ async def _run_postsend(ctx, page, *, run_dir, run_id, deadline, send_ts, conv, 
             result = await _monitor_and_finalize(
                 page, run_dir=run_dir, run_id=run_id,
                 deadline=deadline, send_ts=send_ts, conv=conv, err=err,
+                instruction_boundary_restored=instruction_boundary_restored,
             )
             return result, page
         except RunPageClosed:
@@ -2801,6 +2915,30 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                             timeout_secs=300,
                         )
 
+                # A large native paste can now be represented entirely as a
+                # ``Pasted markdown`` attachment.  In that state the textbox is
+                # empty and the task instructions are no longer a top-level user
+                # message, which recent backend behavior often acknowledges
+                # instead of executing.  Detect the actual DOM outcome (not a
+                # brittle size threshold), add a short execution instruction,
+                # and prove it stuck before the irreversible Send click.
+                try:
+                    instruction_boundary_restored = await _ensure_top_level_instruction(
+                        composer, prompt_chars=len(prompt_text),
+                    )
+                except InstructionBoundaryLost as e:
+                    await safe_screenshot(
+                        page, run_dir / "error-instruction_boundary_lost_before_send.png",
+                    )
+                    try:
+                        (run_dir / "error.html").write_text(await page.content())
+                    except Exception:
+                        pass
+                    log_stage("error", reason="instruction_boundary_lost_before_send",
+                              exception=str(e))
+                    return err("instruction_boundary_lost_before_send",
+                               {"exception": str(e)})
+
                 await safe_screenshot(page, run_dir / "pre-send.png")
 
                 # Re-verify the effort at the point of use — closes the
@@ -2852,11 +2990,10 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
 
                 page.on("framenavigated", _on_frame_navigated)
 
-                # ---- Send: the single irreversible step. The absolute deadline is
-                # created BEFORE the click (monotonic clock) so an ambiguous close —
-                # the click can dispatch the request and THEN raise on tab-close —
-                # still carries a budget. Nothing past this point pastes or sends
-                # again: the post-send helper receives no prompt/composer/send handle.
+                # ---- Send: the single irreversible step. Production uses an
+                # unbounded deadline so long generations can finish naturally.
+                # Nothing past this point pastes or sends again: the post-send
+                # helper receives no prompt/composer/send handle.
                 loop = asyncio.get_running_loop()
                 send_ts = loop.time()
                 deadline = send_ts + DEFAULT_GENERATION_TIMEOUT
@@ -2903,6 +3040,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                     ctx, page, run_dir=run_dir, run_id=run_id,
                     deadline=deadline, send_ts=send_ts, conv=conv,
                     network_log=network_log, err=err,
+                    instruction_boundary_restored=instruction_boundary_restored,
                 )
                 return result
             except Exception as e:
@@ -3060,7 +3198,7 @@ def main() -> int:
     ask_p.add_argument("--run-id", default=None,
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,
-                      help="Max seconds the parent will wait for completion (default 3600).")
+                      help="Max seconds the parent will wait for completion. Default: wait indefinitely. This does not stop the detached worker.")
     ask_p.add_argument("--output", type=Path, default=None,
                       help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged. Ignored with --no-wait.")
     ask_p.add_argument("--no-wait", action="store_true",

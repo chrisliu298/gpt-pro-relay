@@ -81,7 +81,7 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 |---|---|
 | `gpt-pro-relay login` | Open the isolated Chrome Beta app at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
 | `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **GPT-5.6 Sol** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
-| `gpt-pro-relay ask [--run-id ID] [--no-wait] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits for completion, prints response on stdout. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
+| `gpt-pro-relay ask [--run-id ID] [--no-wait] [--generation-timeout SECONDS] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits indefinitely for completion and prints the response on stdout. `--generation-timeout` optionally bounds only this parent wait; it never stops the detached worker. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses while a worker, `login`, or `doctor` holds a browser activity lease; pass `--force` to kill anyway (active users lose their CDP connection). |
 
@@ -114,8 +114,8 @@ your prompt here
 PROMPT
 
 # Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
-deadline=$((SECONDS + 3600)); delay=5
-while (( SECONDS < deadline )); do
+delay=5
+while :; do
   out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
   case $rc in
     0)   printf '%s' "$out"; exit 0 ;;
@@ -124,7 +124,6 @@ while (( SECONDS < deadline )); do
     *)   cat /tmp/gpt-pro-$RUN_ID.err >&2; exit "$rc" ;;
   esac
 done
-echo "gpt-pro-relay overall timeout for $RUN_ID" >&2; exit 124
 ```
 
 The SSH options matter: `-S none` avoids ControlMaster reuse (which can resurrect stale paths), `BatchMode=yes` prevents password-prompt hangs, `ConnectTimeout=15` + `ServerAliveInterval=15`/`CountMax=4` cap a dead session at ~60s instead of 5 min. The Phase 1 submit is idempotent — same `--run-id` + same prompt bytes attaches to an existing run, so a transport-flake retry is safe.
@@ -150,7 +149,7 @@ Exit codes:
 | 0 | `status: ok`, response on stdout (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | `status: error`, see `reason` field |
 | 2 | usage error (empty prompt, prompt_too_large, run_id_conflict, invalid run_id) |
-| 3 | `status: timeout` (browser worker didn't finish within 60 min) |
+| 3 | `status: timeout` from a legacy worker created before the generation cap was removed |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |
 
@@ -162,9 +161,9 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
 - `response.md` — the answer: a completed turn the model audit did not reject. `result.json` reports `extraction: "copy_button"` or `"innertext"`, and `model_audit` — which is `verified` when the served model was confirmed, or a fail-open value (`unverified_missing_slug`, `model_ok_slug_missing`) when a selector break left the model unconfirmed and the run was allowed through anyway. Check it if provenance matters to you.
 - `result.json` — terminal status (atomic). **It is the authority: only `status: "ok"` makes `response.md` usable.**
-- `response.rejected.md` / `response.partial.md` / `response.pending.md` — the extracted text under the name its outcome earned: the served model failed the audit, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. Don't judge by reading them — a wrong-model turn is complete and plausible, and a turn that missed the completion gate can be fully rendered.
+- `response.rejected.md` / `response.incomplete.md` / `response.partial.md` / `response.pending.md` — the extracted text under the name its outcome earned: the served model failed the audit, an attachment-only prompt was acknowledged instead of executed, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. Don't judge by reading them — a rejected or incomplete turn can be fluent and plausible, and a turn that missed the completion gate can be fully rendered.
 
-A run leaves **at most one** of those four names (a failure before extraction publishes none), so the name tells you what you have without opening `result.json`.
+A run leaves **at most one** of those five names (a failure before extraction publishes none), so the name tells you what you have without opening `result.json`.
 - `conversation.json` — `{url, captured_at}`, the ChatGPT conversation this run submitted to. Diagnostic breadcrumb for manual recovery; written once the URL is known.
 - `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
 - `final.html` — last DOM snapshot
@@ -179,16 +178,16 @@ Because Chrome Beta stays alive indefinitely, restart it periodically after its 
 
 ## Closing the Chrome tab mid-run
 
-If you accidentally close a worker's Chrome tab/window while it's generating, the worker reopens the **same** conversation on a fresh tab and resumes monitoring — it never re-pastes or re-sends (a resend would burn another 5–20 min of Pro reasoning). Watch for `conversation_url_captured`, then `page_recovery_attempt` → `page_recovery_succeeded` in `worker.stderr`. Recovery is bounded (3 reopens) and runs entirely inside the **original** 60-min generation budget — it never grants a fresh deadline.
+If you accidentally close a worker's Chrome tab/window while it's generating, the worker reopens the **same** conversation on a fresh tab and resumes monitoring — it never re-pastes or re-sends (a resend would burn another 5–20 min of Pro reasoning). Watch for `conversation_url_captured`, then `page_recovery_attempt` → `page_recovery_succeeded` in `worker.stderr`. Recovery is bounded to 3 reopens, and each navigation/check has its own finite timeout; there is no overall generation deadline.
 
 Terminal (not auto-recovered) cases, all fail closed with a specific `reason`:
 - **Closing before the conversation URL is captured** (`page_closed_before_conversation_url` / `send_outcome_unknown`) — the send may be in flight server-side, but with no captured URL the worker refuses to guess a conversation or resubmit.
 - **Quitting/killing Chrome or a full CDP disconnect** (`browser_disconnected_after_send`) — recovery reopens a tab in the *surviving* context only; it does not relaunch Chrome under sibling workers.
 - **A recovery navigation that redirects to login/home/another conversation, drops auth, or never renders the conversation** (`page_recovery_failed` with a `recovery_reason`).
 - **A reopened tab that is then navigated to a different conversation** (e.g. a human grabs the background tab) — `conversation_drift`; the worker refuses to extract/return another conversation's answer.
-- **Repeated closes exhausting the budget** (`page_recovery_exhausted`), or the deadline expiring mid-recovery (`status: timeout`).
+- **Repeated closes exhausting the recovery count** (`page_recovery_exhausted`).
 
-Whether ChatGPT resumes *live* streaming on reopen (vs. only showing the finished turn) is server-side behavior; either way the Copy-button completion gate and served-model audit still apply, so the worst case is a clean timeout, never a wrong or partial answer.
+Whether ChatGPT resumes *live* streaming on reopen (vs. only showing the finished turn) is server-side behavior; either way the Copy-button completion gate and served-model audit still apply, so the relay never returns an unverified partial as an answer. With no overall generation deadline, a frozen recovered turn must be interrupted explicitly with `gpt-pro-relay stop <run-id>`.
 
 ## Troubleshooting
 
@@ -213,6 +212,7 @@ Fix: open the app once from the Mac's own screen and approve the prompt (or **Op
 What is *not* established: in the one observed incident, `xattr -dr com.apple.quarantine` alone did **not** release the process, while a broader `xattr -cr` (which also removed `com.apple.FinderInfo`) coincided with success — but a human approval click landed in the same window, so the two were never isolated. Do not treat `xattr -cr` as the known remedy. It clears *every* attribute on *every* bundle member, which is a wider security bypass than the problem calls for. Prefer the interactive approval; reach for attribute clearing only as a deliberate, trusted-source last resort.
 
 ## Known limitations
+- ChatGPT converts large native pastes into a `Pasted markdown` attachment at a frontend-controlled threshold. The relay detects the resulting empty composer rather than hard-coding that threshold, inserts and verifies a short top-level execution instruction before Send, and fails pre-send with `instruction_boundary_lost_before_send` if it cannot prove that boundary. If the backend nevertheless only acknowledges the file and offers to continue, the run fails with `instruction_boundary_lost` and publishes the diagnostic body as `response.incomplete.md`.
 - Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
 - Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.

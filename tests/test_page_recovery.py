@@ -5,8 +5,8 @@ SAME captured conversation on a fresh tab and resume monitoring — never
 re-pasting or re-sending (a resend burns 5-20 min of Pro reasoning). These pin
 the safety properties: closure is detected (not swallowed as empty text or a
 fail-open audit), the conversation URL is validated before it is trusted,
-recovery is bounded, the original generation deadline is preserved, and a
-non-closure failure is never converted into a recovery.
+recovery is bounded, finite injected deadlines remain preserved for safety
+testing, and a non-closure failure is never converted into a recovery.
 
 Whether ChatGPT actually resumes DOM streaming after reopening a mid-flight
 conversation is server/UI behavior that fakes cannot prove — that is the
@@ -679,13 +679,14 @@ def _fake_turn(env, *, text, copied=None, slug=None, menu=None, copy_present=Tru
     env.setattr(cli, "read_selected_model", _menu)
 
 
-async def _finalize(tmp_path, *, budget=100.0):
+async def _finalize(tmp_path, *, budget=100.0, instruction_boundary_restored=False):
     import asyncio
     loop = asyncio.get_running_loop()
     return await _monitor_and_finalize(
         _FinalizePage(), run_dir=tmp_path, run_id="r1",
         deadline=loop.time() + budget, send_ts=loop.time(),
         conv=_ConversationUrl(), err=_noop_err,
+        instruction_boundary_restored=instruction_boundary_restored,
     )
 
 
@@ -704,6 +705,45 @@ async def test_monitor_publishes_canonical_only_when_verified_and_complete(_fina
     assert result["model_audit"] == "verified"
     assert _artifacts(tmp_path) == {"response.md"}
     assert (tmp_path / "response.md").read_text() == "the answer (markdown)"
+
+
+async def test_monitor_quarantines_attachment_acknowledgement(_finalize_env, tmp_path):
+    acknowledgement = (
+        "文件已收到。请直接发送下一步指令，例如‘开始完整审阅’，"
+        "我将继续给出完整技术评审。"
+    )
+    _fake_turn(_finalize_env, text=acknowledgement,
+               copied=acknowledgement, slug="gpt-5-6-pro")
+
+    result = await _finalize(tmp_path, instruction_boundary_restored=True)
+
+    assert result["reason"] == "instruction_boundary_lost"
+    assert result["completed"] is True
+    assert _artifacts(tmp_path) == {"response.incomplete.md"}
+    assert (tmp_path / "response.incomplete.md").read_text() == acknowledgement
+
+
+async def test_monitor_does_not_quarantine_legitimate_short_attached_answer(_finalize_env, tmp_path):
+    _fake_turn(_finalize_env, text="4", copied="4", slug="gpt-5-6-pro")
+
+    result = await _finalize(tmp_path, instruction_boundary_restored=True)
+
+    assert result["status"] == "ok"
+    assert _artifacts(tmp_path) == {"response.md"}
+
+
+async def test_monitor_scopes_ack_guard_to_attachment_boundary(_finalize_env, tmp_path):
+    # Inline prompts can deliberately ask for this wording; the semantic guard
+    # is only justified when the relay observed and repaired an attachment-only
+    # user turn.
+    acknowledgement = "I received the attached file. Tell me the task and I will continue."
+    _fake_turn(_finalize_env, text=acknowledgement,
+               copied=acknowledgement, slug="gpt-5-6-pro")
+
+    result = await _finalize(tmp_path, instruction_boundary_restored=False)
+
+    assert result["status"] == "ok"
+    assert _artifacts(tmp_path) == {"response.md"}
 
 
 async def test_monitor_quarantines_answer_on_model_mismatch(_finalize_env, tmp_path):
@@ -1090,9 +1130,11 @@ class _ScriptedMonitor:
     def __init__(self, actions):
         self._actions = list(actions)
         self.calls = []
+        self.call_kwargs = []
 
-    async def __call__(self, page, **_kwargs):
+    async def __call__(self, page, **kwargs):
         self.calls.append(page)
+        self.call_kwargs.append(kwargs)
         action = self._actions.pop(0)
         if action == "close":
             raise RunPageClosed()
@@ -1143,7 +1185,10 @@ def _postsend_env(monkeypatch):
     return monkeypatch
 
 
-async def _run_postsend(env, *, actions, reasons=(), ctx, conv_url, tmp_path, p0=None):
+async def _run_postsend(
+    env, *, actions, reasons=(), ctx, conv_url, tmp_path, p0=None,
+    instruction_boundary_restored=False,
+):
     import asyncio
     monitor = _ScriptedMonitor(actions)
     recover = _ScriptedRecover(reasons)
@@ -1160,6 +1205,7 @@ async def _run_postsend(env, *, actions, reasons=(), ctx, conv_url, tmp_path, p0
     result, page = await cli._run_postsend(
         ctx, p0, run_dir=tmp_path, run_id="r1", deadline=deadline,
         send_ts=now, conv=conv, network_log=[], err=_noop_err,
+        instruction_boundary_restored=instruction_boundary_restored,
     )
     return result, page, monitor, recover, p0
 
@@ -1174,6 +1220,16 @@ async def test_postsend_happy_path_no_recovery(_postsend_env, tmp_path):
     assert page is p0                 # no rebind
     assert ctx.new_page_calls == 0    # no recovery
     assert monitor.calls == [p0]
+
+
+async def test_postsend_preserves_instruction_boundary_state(_postsend_env, tmp_path):
+    result, _page, monitor, _rec, _p0 = await _run_postsend(
+        _postsend_env, actions=[{"status": "ok", "exit_code": 0}],
+        ctx=_FakeCtx(), conv_url="https://chatgpt.com/c/abc", tmp_path=tmp_path,
+        instruction_boundary_restored=True,
+    )
+    assert result["status"] == "ok"
+    assert monitor.call_kwargs[0]["instruction_boundary_restored"] is True
 
 
 async def test_postsend_recovers_once_returns_new_page(_postsend_env, tmp_path):
