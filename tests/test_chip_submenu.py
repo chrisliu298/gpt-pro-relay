@@ -1,35 +1,33 @@
-"""Regression tests for the 2026-08 two-level chip menu navigation.
+"""Regression tests for the 2026-08-28 flat chip menu (Power slider + model list).
 
-The redesign replaced the flat "Intelligence" effort list with a top-level
-"Power" slider plus two submenu rows behind an "Advanced" toggle:
+The 2026-08-28 ChatGPT redesign REPLACED the two-level "Model/Effort" submenu
+with a single flat menu. Clicking the composer chip
+(`button.__composer-pill[aria-haspopup="menu"]`) now opens ONE
+`[role=menu][data-state="open"]` containing:
 
-    [role=menu]  Power(slider) / Advanced / Model > / Effort >
-                                                        └─ Instant .. Pro
+    [role=menu][data-state="open"]
+      role=menuitem  aria-label="Power"       <- the effort slider handle;
+                                                 wraps role=slider 0..4
+                                                 (0 Instant .. 4 Pro)
+      role=menuitemradio  "GPT-5.6 Sol"        <- model list, FLAT (no submenu)
+      role=menuitemradio  "GPT-5.5"
+      role=menuitem  aria-label="Select model" <- view toggle
 
-Three things broke at once, and each is pinned below:
+What broke: the `aria-haspopup="menu"` "Effort" row is gone, so the old
+`_open_chip_submenu(EFFORT_ROW)` + `menuitemradio[name="Pro"]` click timed out
+(chip_menuitem_missing → model_select_failed). Effort is now a slider, driven by
+CLICKING the Power menuitem then pressing `End` — the click commits the
+interaction (a bare focus()+ArrowRight reverts on reload, verified live), and
+`End` drives to the top tier from any position.
 
-1. The named effort leaves moved one level deeper, so `ensure_pro_chip`'s
-   direct `menuitemradio[name="Pro"]` click found nothing → model_select_failed
-   (fail-closed, but the tool could not run at all).
-2. The rows only appear once "Advanced" is expanded, and that expansion resets
-   to compact on every page load — so it must be redone every run.
-3. The rows open on CLICK, not hover: each row is a wrapper div whose inner
-   button swallows pointer events ("subtree intercepts pointer events"), so the
-   old hover-driven `read_selected_model` silently returned None.
-
-The bulk of these tests, though, pin SUBMENU IDENTITY, because that is where a
-wrong answer can escape. Radix keeps a dismissed menu mounted through its exit
-animation, so "is there a second [role=menu]?" is not the same question as "is
-the menu this row owns open?". Resolving the wrong one fails in two directions:
-
-  - the MAIN menu holds a slider and no checked menuitemradio, so it reads as
-    None → `unverified_missing_slug`, which fails OPEN (backstop silently lost);
-  - a stale EFFORT submenu reads "Pro" as a model name → `menu_mismatch`, a
-    FATAL verdict on a healthy run.
-
-The fake therefore models menu ids, `data-state` (open vs closing), per-row
-`aria-controls` ownership, delayed mounting, and pre-existing menus — an
-implementation that resolves `[role=menu].last` fails these.
+These tests pin:
+  - the slow path DRIVES THE SLIDER (click Power + End) and never reaches for
+    the removed submenu / named effort radio;
+  - it fails closed when the slider never reaches its max OR the chip never
+    settles on "Pro";
+  - the fast path (chip already "Pro") no-ops without opening the menu;
+  - `read_selected_model` reads the checked radio directly from the flat menu,
+    returns None when unreadable, and does not toggle an already-open menu shut.
 """
 
 import re
@@ -37,253 +35,138 @@ import re
 import pytest
 
 from gpt_pro import cli
-from gpt_pro.cli import (
-    ADVANCED_EXPAND_LABEL,
-    EFFORT_ROW,
-    MODEL_ROW,
-    _open_chip_submenu,
-    read_selected_model,
-)
+from gpt_pro.cli import ensure_pro_chip, read_selected_model
 
 
-class _Menu:
-    def __init__(self, menu_id, *, state="open", radio=None):
-        self.id = menu_id
-        self.state = state
-        self.radio = radio  # innerText of the aria-checked="true" menuitemradio
+# The value the slider must reach to be "Pro" (aria-valuemax). Tier index:
+# 0 Instant, 1 Medium, 2 High, 3 Extra High, 4 Pro.
+_MAX = 4
+_TIER_LABEL = {0: "Instant", 1: "Medium", 2: "High", 3: "Extra High", 4: "Pro"}
 
 
-class _Row:
-    def __init__(self, page, label, *, submenu_id, radio, opens_after=0, sets_controls=True):
-        self.page = page
-        self.label = label
-        self.submenu_id = submenu_id
-        self.radio = radio
-        self.expanded = False
-        self.opens_after = opens_after  # clicks->polls of delay before it mounts
-        self.sets_controls = sets_controls
-        self._pending = None
-
-    async def click(self, timeout=None):
-        self.page.clicks.append(self.label)
-        if self.expanded:
-            # Radix toggles: clicking an expanded row collapses it. Production
-            # must not do this — the re-entrancy test asserts we never get here.
-            self.expanded = False
-            self.page.menus = [m for m in self.page.menus if m.id != self.submenu_id]
-            return
-        self._pending = self.opens_after
-        if self._pending == 0:
-            self._mount()
-
-    def _mount(self):
-        self.expanded = True
-        self.page.menus.append(_Menu(self.submenu_id, radio=self.radio))
-
-    def tick(self):
-        if self._pending:
-            self._pending -= 1
-            if self._pending == 0:
-                self._mount()
-
-    async def get_attribute(self, name):
-        if name == "aria-expanded":
-            return "true" if self.expanded else "false"
-        if name == "aria-controls":
-            return self.submenu_id if (self.expanded and self.sets_controls) else None
-        raise AssertionError(f"unexpected attribute {name!r}")
-
-    async def hover(self, **_kw):
-        # The real row's inner button intercepts pointer events, so hover never
-        # lands. Any code that reaches for hover again must fail loudly.
-        self.page.hovers.append(self.label)
-        raise TimeoutError("subtree intercepts pointer events")
-
-
-class _ExpandItem:
-    def __init__(self, page):
-        self.page = page
-
-    async def click(self, timeout=None):
-        self.page.clicks.append(ADVANCED_EXPAND_LABEL)
-        if self.page.expand_raises:
-            raise TimeoutError("advanced toggle not clickable")
-        self.page.compact = False
-
-
-class _MenuLocator:
-    """Resolves menus by id (and optionally by open state)."""
-
-    def __init__(self, page, menu_id, *, require_open):
-        self.page = page
-        self.menu_id = menu_id
-        self.require_open = require_open
-
-    def _match(self):
-        return [
-            m
-            for m in self.page.menus
-            if m.id == self.menu_id and (not self.require_open or m.state == "open")
-        ]
-
-    async def count(self):
-        self.page.tick()
-        return len(self._match())
-
-    async def evaluate(self, _js):
-        found = self._match()
-        return found[0].radio if found else None
-
-    def get_by_role(self, role, name=None):
-        return _RadioItem(self.page, self.menu_id, role, getattr(name, "pattern", name))
-
-
-class _RadioItem:
-    def __init__(self, page, menu_id, role, name):
-        self.page = page
-        self.menu_id = menu_id
-        self.role = role
-        self.name = name
-
-    @property
-    def first(self):
-        return self
-
-    async def click(self, timeout=None):
-        self.page.clicks.append(f"{self.menu_id}:{self.role}:{self.name}")
-
-
-class _MenuListLocator:
-    """All `[role=menu]` nodes, INCLUDING ones closing through their exit
-    animation — which is precisely why document order is not identity."""
-
-    def __init__(self, page):
-        self.page = page
-
-    async def count(self):
-        # Ticking here too keeps the harness FAIR: a delayed mount advances for
-        # any implementation that polls, not only for one that calls evaluate().
-        self.page.tick()
-        return len(self.page.menus)
-
-    @property
-    def last(self):
-        # Radix portals append, so the newest menu really is last in document
-        # order — which is why `.last` looks right until a mount is delayed.
-        return _MenuLocator(self.page, self.page.menus[-1].id, require_open=False)
-
-
-class _RowLocator:
-    def __init__(self, page, rows):
-        self.page = page
-        self.rows = rows
-
-    async def count(self):
-        return len(self.rows)
-
-    def filter(self, has_text=None):
-        keep = [r for r in self.rows if has_text is None or has_text.search(r.label)]
-        return _RowLocator(self.page, keep)
-
-    @property
-    def first(self):
-        return self.rows[0]
-
-
-class _ChipLocator:
-    """The chip is a TOGGLE — clicking it while open closes the menu."""
-
+class _FakeChip:
     def __init__(self, page):
         self.page = page
 
     @property
     def first(self):
         return self
+
+    async def wait_for(self, **_kw):
+        return None
 
     async def get_attribute(self, name):
         assert name == "aria-expanded", name
-        return "true" if self.page.chip_open else "false"
+        return "true" if self.page.menu_open else "false"
 
     async def click(self, timeout=None):
         self.page.clicks.append("chip")
-        if self.page.chip_open:
-            # Closing the chip menu tears down the whole tree: what is left
-            # behind is only menus in their exit animation.
-            self.page.chip_open = False
-            for m in self.page.menus:
-                m.state = "closed"
-            for r in self.page.rows:
-                r.expanded = False
-        else:
-            self.page.chip_open = True
+        # Toggle: clicking an open menu closes it.
+        self.page.menu_open = not self.page.menu_open
+
+    async def inner_text(self):
+        # The chip shows the generic label while the menu is open, and the
+        # committed effort tier once it closes — exactly like the live UI.
+        if self.page.menu_open:
+            return "Thinking effort"
+        return _TIER_LABEL[self.page.slider_value]
 
 
-class _FakeMenuPage:
-    """Models the redesigned chip menu: ids, open/closing state, ownership."""
+class _FakePowerMenuItem:
+    def __init__(self, page):
+        self.page = page
 
-    MAIN_ID = "menu-main"
+    @property
+    def first(self):
+        return self
 
+    async def click(self, timeout=None):
+        # Live behaviour: the click engages the slider (and can jump it toward
+        # the click position). We model it as "engaged" without moving to max,
+        # so only the subsequent End/ArrowRight actually reaches Pro.
+        self.page.clicks.append("power")
+        self.page.slider_engaged = True
+
+
+class _FakeMenuLocator:
+    """Resolves `[role=menu][data-state="open"]` and evaluates JS against it."""
+
+    def __init__(self, page):
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    async def evaluate(self, js):
+        if not self.page.menu_open:
+            return None
+        # SLIDER_STATE_JS: {now, max} or null when no slider.
+        if "role=\"slider\"" in js or "aria-valuenow" in js:
+            if self.page.has_slider:
+                return {"now": str(self.page.slider_value), "max": str(_MAX)}
+            return None
+        # SELECTED_MODEL_JS: checked radio's text or null.
+        if "menuitemradio" in js:
+            for label, checked in self.page.model_radios:
+                if checked:
+                    return label
+            return None
+        raise AssertionError(f"unexpected evaluate js: {js!r}")
+
+
+class _FakePage:
     def __init__(
         self,
         *,
-        compact=True,
-        expand_raises=False,
-        extra_menus=(),
-        opens_after=0,
-        sets_controls=True,
-        main_radio=None,
-        chip_open=False,
+        chip_texts=None,
+        slider_value=0,
+        menu_open=False,
+        has_slider=True,
+        slider_maxes=True,
+        model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)),
+        chip_settles_pro=True,
     ):
-        self.compact = compact
-        self.expand_raises = expand_raises
-        self.chip_open = chip_open
+        self.slider_value = slider_value
+        self.menu_open = menu_open
+        self.has_slider = has_slider
+        # When False, End/ArrowRight never advance the slider (models a stuck /
+        # missing slider so the drive fails closed).
+        self.slider_maxes = slider_maxes
+        self.slider_engaged = False
+        self.model_radios = list(model_radios)
+        # If False, the chip never reads is_pro_label even after a "successful"
+        # drive (models the top tier no longer being labeled "Pro").
+        self.chip_settles_pro = chip_settles_pro
+        self._chip = _FakeChip(self)
         self.clicks = []
-        self.hovers = []
         self.keys = []
-        # The MAIN menu really has a slider and NO checked radio (2026-08); the
-        # default None models that. Tests override it to prove we never read it.
-        self.menus = [_Menu(self.MAIN_ID, radio=main_radio), *extra_menus]
-        self.rows = [
-            _Row(self, "Model\nGPT-5.6 Sol", submenu_id="menu-model",
-                 radio="GPT-5.6 Sol", opens_after=opens_after, sets_controls=sets_controls),
-            _Row(self, "Effort\nMedium", submenu_id="menu-effort",
-                 radio="Pro", opens_after=opens_after, sets_controls=sets_controls),
-        ]
         self._closed = False
 
+    # ---- Playwright-ish surface ----
     def locator(self, selector):
         if selector == cli.COMPOSER_CHIP:
-            return _ChipLocator(self)
-        if ADVANCED_EXPAND_LABEL in selector:
-            return _RowLocator(self, [_ExpandItem(self)] if self.compact else [])
-        if 'aria-haspopup="menu"' in selector:
-            # Rows are reachable only once expanded.
-            return _RowLocator(self, [] if self.compact else self.rows)
-        m = re.match(r'\[role="menu"\]\[id="([^"]+)"\](\[data-state="open"\])?$', selector)
-        if m:
-            return _MenuLocator(self, m.group(1), require_open=bool(m.group(2)))
-        if selector == '[role="menu"]':
-            # Deliberately supported so a regression to the old global
-            # `count() >= 2` / `.last` resolution fails on BEHAVIOUR (it returns
-            # the wrong menu's contents) rather than on an unsupported-selector
-            # AssertionError, which would be a harness artifact, not a catch.
-            return _MenuListLocator(self)
+            return _FakeChip(self)
+        if selector == cli.POWER_MENUITEM:
+            return _FakePowerMenuItem(self)
+        if selector == cli.OPEN_MENU:
+            return _FakeMenuLocator(self)
         raise AssertionError(f"unexpected selector {selector!r}")
 
-    def tick(self):
-        for row in self.rows:
-            row.tick()  # each poll advances a delayed mount
+    def get_by_role(self, *a, **k):
+        raise AssertionError("slow path must not use get_by_role (old submenu radio)")
 
-    async def evaluate(self, js):
-        assert "data-state=" in js and "role=" in js, js
-        self.tick()
-        return [m.id for m in self.menus if m.state == "open"]
+    async def wait_for_selector(self, selector, timeout=None):
+        assert selector == cli.OPEN_MENU, selector
+        if not self.menu_open:
+            raise TimeoutError("menu did not open")
+        return None
+
+    async def content(self):
+        return "<html></html>"
 
     def is_closed(self):
         return self._closed
-
-    async def wait_for_selector(self, _selector, timeout=None):
-        return None
 
     @property
     def keyboard(self):
@@ -292,185 +175,177 @@ class _FakeMenuPage:
         class _KB:
             async def press(self, key):
                 page.keys.append(key)
+                if key in ("End", "ArrowRight") and page.slider_engaged and page.slider_maxes:
+                    page.slider_value = _MAX
+                if key == "Escape":
+                    page.menu_open = False
 
         return _KB()
 
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    async def _instant(_delay):
-        return None
+    # Make the 0.2s poll sleeps instant, and advance a FAKE clock by the slept
+    # amount so the bounded `time.time()` deadlines in the drive/read loops
+    # terminate deterministically instead of busy-spinning real wall-clock.
+    clock = {"t": 1_000_000.0}
+
+    async def _instant(delay):
+        clock["t"] += max(delay, 0.05)
 
     monkeypatch.setattr(cli.asyncio, "sleep", _instant)
+    monkeypatch.setattr(cli.time, "time", lambda: clock["t"])
 
 
-# ---- navigation mechanics -------------------------------------------------
+@pytest.fixture(autouse=True)
+def _stub_slow_path_side_effects(monkeypatch):
+    """`ensure_pro_chip`'s slow path takes UiClipboardLock and drives the OS
+    focus; stub those so the test exercises only the menu logic."""
+    monkeypatch.setattr(cli, "UiClipboardLock", lambda: _NullCtx())
+    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda: None)
 
-async def test_expands_advanced_before_reaching_the_rows():
-    # The rows live behind the "Advanced" toggle, which resets to compact on
-    # every page load — so every run must expand before it can click a row.
-    page = _FakeMenuPage(compact=True)
-    await _open_chip_submenu(page, EFFORT_ROW)
-    assert page.clicks[0] == ADVANCED_EXPAND_LABEL
-    assert page.clicks[1] == "Effort\nMedium"
+    async def _noop_front(_page):
+        return None
 
+    async def _noop_shot(_page, _path, **_kw):
+        return None
 
-async def test_expand_is_skipped_when_already_expanded():
-    # The expand locator keys on the DIRECTIONAL aria-label, so it matches only
-    # in the compact state. A blind toggle would COLLAPSE an open menu here.
-    page = _FakeMenuPage(compact=False)
-    await _open_chip_submenu(page, EFFORT_ROW)
-    assert page.clicks == ["Effort\nMedium"]
+    monkeypatch.setattr(cli, "bring_tab_to_front", _noop_front)
+    monkeypatch.setattr(cli, "safe_screenshot", _noop_shot)
 
 
-async def test_rows_are_opened_by_click_never_hover():
-    # The pre-2026-08 code hovered; the wrapper row's inner button intercepts
-    # pointer events so hover never lands. Any regression to hover fails here.
-    page = _FakeMenuPage(compact=False)
-    await _open_chip_submenu(page, MODEL_ROW)
-    assert page.hovers == []
-    assert page.clicks == ["Model\nGPT-5.6 Sol"]
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
-async def test_returns_the_submenu_owned_by_the_requested_row():
-    # Two rows carry aria-haspopup="menu". The returned menu must be the one
-    # THAT row owns — not merely "a second menu".
-    page = _FakeMenuPage(compact=False)
-    assert await (await _open_chip_submenu(page, MODEL_ROW)).evaluate("") == "GPT-5.6 Sol"
+# ---- ensure_pro_chip: fast path ------------------------------------------
 
-    page2 = _FakeMenuPage(compact=False)
-    assert await (await _open_chip_submenu(page2, EFFORT_ROW)).evaluate("") == "Pro"
-
-
-async def test_resolves_by_ownership_when_a_stale_closing_menu_is_attached():
-    # Radix keeps a dismissed menu mounted through its exit animation. A global
-    # `.last` / `count() >= 2` can resolve THAT one. Here a stale effort submenu
-    # is still attached (data-state="closed") when we open the Model row.
-    stale = _Menu("menu-effort-stale", state="closed", radio="Pro")
-    page = _FakeMenuPage(compact=False, extra_menus=[stale])
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    # "Pro" here would be the stale EFFORT menu read as a model name ->
-    # menu_mismatch, a fatal verdict on a healthy run.
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_fast_path_noops_when_chip_already_pro(tmp_path):
+    # Chip reads "Pro" -> no lock, no menu, no slider drive.
+    page = _FakePage(slider_value=_MAX, menu_open=False)
+    ok, text = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert (ok, text) == (True, "Pro")
+    assert page.clicks == []  # never opened the menu
+    assert page.keys == []
 
 
-async def test_ignores_an_unrelated_menu_that_is_already_open():
-    # A second menu open for an unrelated reason must not be mistaken for the
-    # submenu: it existed BEFORE the click, so it is not "freshly opened".
-    unrelated = _Menu("menu-unrelated", radio="something else")
-    page = _FakeMenuPage(compact=False, extra_menus=[unrelated])
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+# ---- ensure_pro_chip: slow path drives the slider ------------------------
+
+async def test_slow_path_drives_slider_to_pro_from_instant(tmp_path):
+    # The exact repro: chip stuck on "Instant" (slider value 0). The slow path
+    # opens the menu, clicks Power, presses End to reach the max tier, closes
+    # the menu, and confirms the chip reads "Pro".
+    page = _FakePage(slider_value=0, menu_open=False)
+    ok, text = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert (ok, text) == (True, "Pro")
+    # Drove by click(Power)+End, never a submenu / named radio.
+    assert "power" in page.clicks
+    assert "End" in page.keys
+    assert page.slider_value == _MAX
 
 
-async def test_waits_for_a_delayed_submenu_instead_of_grabbing_another_menu():
-    # The submenu mounts a few polls late while the main menu is already there.
-    page = _FakeMenuPage(compact=False, opens_after=3)
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_slow_path_never_uses_the_removed_submenu_radio(tmp_path):
+    # Regression guard: the old mechanism called page.get_by_role(...) to click
+    # a `menuitemradio[name="Pro"]`. The fake raises if that path is taken.
+    page = _FakePage(slider_value=1, menu_open=False)  # "Medium"
+    ok, _ = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert ok  # (get_by_role would have raised AssertionError)
 
 
-async def test_stale_menu_plus_delayed_mount_does_not_resolve_the_stale_one():
-    # THE discriminating case, and the only one where the old global
-    # `count() >= 2` + `.last` resolution is actually exploitable. Radix portals
-    # append, so `.last` is usually the newest menu and looks correct — until a
-    # stale menu is still attached AND the real submenu has not mounted yet.
-    # Then the count threshold is already satisfied on the first poll and `.last`
-    # is the STALE menu, whose checked radio is the effort tier "Pro" — read as
-    # a model name that is `menu_mismatch`, a fatal verdict on a healthy run.
-    stale = _Menu("menu-effort-stale", state="closed", radio="Pro")
-    page = _FakeMenuPage(compact=False, extra_menus=[stale], opens_after=3)
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_slow_path_fails_closed_when_slider_never_maxes(tmp_path):
+    # A stuck/missing slider (End/ArrowRight never advance it) must fail closed
+    # with model_select_failed, not spin forever.
+    page = _FakePage(slider_value=0, slider_maxes=False)
+    ok, text = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert ok is False
+    assert not cli.is_pro_label(text)
 
 
-async def test_falls_back_to_the_freshly_opened_menu_without_aria_controls():
-    # aria-controls is a Radix implementation detail. If it is ever dropped, the
-    # "menu that opened as a result of this click" fallback still excludes the
-    # main menu and any stale one — so a rename degrades, it does not brick.
-    stale = _Menu("menu-stale", state="closed", radio="Pro")
-    page = _FakeMenuPage(compact=False, sets_controls=False, extra_menus=[stale])
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_slow_path_fails_closed_when_slider_absent(tmp_path):
+    # SLIDER_STATE_JS returns null (selector break) -> drive can't confirm max
+    # -> fail closed.
+    page = _FakePage(slider_value=0, has_slider=False)
+    ok, _ = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert ok is False
 
 
-async def test_does_not_collapse_a_row_that_is_already_expanded():
-    # Re-entrancy: clicking an expanded row toggles it SHUT. Read its owned menu
-    # instead of clicking. (This is the state a call entering with menus already
-    # open lands in.)
-    page = _FakeMenuPage(compact=False)
-    page.rows[0].expanded = True
-    page.menus.append(_Menu("menu-model", radio="GPT-5.6 Sol"))
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert page.clicks == []  # never clicked -> never collapsed
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_slow_path_fails_closed_when_chip_never_reads_pro(tmp_path):
+    # Slider reaches max but the chip label never becomes is_pro_label (models
+    # the top tier no longer being called "Pro"): the name-anchored chip gate
+    # fails closed even though the slider maxed.
+    page = _FakePage(slider_value=0, chip_settles_pro=False)
+    # Force the chip to always report a non-Pro label once closed.
+    _MonkeyChipText(page, always="Ultra")
+    ok, text = await ensure_pro_chip(page, run_dir=tmp_path)
+    assert ok is False
+    assert not cli.is_pro_label(text)
 
 
-async def test_raises_when_the_submenu_never_opens():
-    # Fail closed rather than return an arbitrary menu.
-    page = _FakeMenuPage(compact=False, opens_after=None)
-    with pytest.raises(RuntimeError, match="did not open"):
-        await _open_chip_submenu(page, MODEL_ROW, timeout=0.05)
+class _MonkeyChipText:
+    """Overrides the closed-menu chip label the fake reports (for the
+    'top tier not called Pro' case) without touching the slider mechanics."""
+
+    def __init__(self, page, *, always):
+        self._always = always
+        orig_locator = page.locator
+
+        def _locator(selector):
+            if selector == cli.COMPOSER_CHIP:
+                chip = _FakeChip(page)
+                orig_inner = chip.inner_text
+
+                async def _inner():
+                    if page.menu_open:
+                        return "Thinking effort"
+                    return self._always
+
+                chip.inner_text = _inner
+                return chip
+            return orig_locator(selector)
+
+        page.locator = _locator
 
 
-async def test_expansion_failure_is_best_effort():
-    # Navigation is forgiving, verification is not: an "Advanced" toggle that
-    # really RAISES must not abort, as long as the rows are reachable anyway.
-    # (The toggle is present and raising — not absent — so the swallow is what
-    # is under test; deleting the try/except fails this.)
-    page = _FakeMenuPage(compact=True, expand_raises=True)
-    page.rows_reachable_while_compact = True
-    original = page.locator
+# ---- read_selected_model: flat model list --------------------------------
 
-    def _locator(selector):
-        if 'aria-haspopup="menu"' in selector and ADVANCED_EXPAND_LABEL not in selector:
-            return _RowLocator(page, page.rows)  # reachable despite compact
-        return original(selector)
-
-    page.locator = _locator
-    submenu = await _open_chip_submenu(page, MODEL_ROW)
-    assert ADVANCED_EXPAND_LABEL in page.clicks  # the raising click was attempted
-    assert await submenu.evaluate("") == "GPT-5.6 Sol"
+async def test_read_selected_model_reads_checked_radio(tmp_path):
+    page = _FakePage(menu_open=False,
+                     model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)))
+    assert await read_selected_model(page, timeout=1.0) == "GPT-5.6 Sol"
 
 
-# ---- read_selected_model --------------------------------------------------
+async def test_read_selected_model_reads_a_drifted_default(tmp_path):
+    # A default drifted to GPT-5.5 must be reported (so doctor/audit can flag it).
+    page = _FakePage(menu_open=False,
+                     model_radios=(("GPT-5.6 Sol", False), ("GPT-5.5", True)))
+    assert await read_selected_model(page, timeout=1.0) == "GPT-5.5"
 
-async def test_read_selected_model_reads_the_submenu_radio():
-    assert await read_selected_model(_FakeMenuPage(compact=True), timeout=1.0) == "GPT-5.6 Sol"
+
+async def test_read_selected_model_returns_none_when_no_radio_checked(tmp_path):
+    # No checked radio (selector break) -> None -> unverified_missing_slug
+    # (fail-open) / doctor "unknown".
+    page = _FakePage(menu_open=False,
+                     model_radios=(("GPT-5.6 Sol", False), ("GPT-5.5", False)))
+    assert await read_selected_model(page, timeout=0.3) is None
 
 
-async def test_read_selected_model_returns_none_when_submenu_never_opens():
-    # Degrades to None ("unknown" in doctor) rather than reading another menu.
-    page = _FakeMenuPage(compact=True, opens_after=None)
+async def test_read_selected_model_returns_none_when_menu_never_opens(tmp_path):
+    class _StuckPage(_FakePage):
+        async def wait_for_selector(self, selector, timeout=None):
+            raise TimeoutError("menu did not open")
+
+    page = _StuckPage(menu_open=False)
     assert await read_selected_model(page, timeout=0.05) is None
 
 
-async def test_read_selected_model_never_reports_the_main_menu_contents():
-    # THE fail-open guard. The real main menu has a slider and no checked radio,
-    # so resolving it yields None -> unverified_missing_slug (fail-OPEN). Here
-    # the main menu is given a checked radio anyway: if the resolution ever
-    # falls back to it, this returns a bogus model instead of failing.
-    page = _FakeMenuPage(compact=True, opens_after=None, main_radio="Pro")
-    assert await read_selected_model(page, timeout=0.05) is None
-
-
-async def test_read_selected_model_does_not_toggle_an_already_open_chip_menu():
-    # Live repro: called straight after ensure_pro_chip — which returns with its
-    # menu still open — a blind chip.click() CLOSED the menu, leaving only
-    # exit-animating menus, and the read degraded to None. None is the fail-OPEN
-    # `unverified_missing_slug` verdict, so it weakens the missing-slug backstop
-    # silently. Production does not hit this ordering today (the composer click
-    # between them dismisses the menu); this pins that we don't rely on that.
-    page = _FakeMenuPage(compact=False, chip_open=True)
-    page.rows[0].expanded = True
-    page.menus.append(_Menu("menu-model", radio="GPT-5.6 Sol"))
+async def test_read_selected_model_does_not_toggle_an_already_open_menu(tmp_path):
+    # Entering with the menu already open, a blind chip.click() would CLOSE it.
+    # _open_chip_menu guards on aria-expanded, so we never click the chip.
+    page = _FakePage(menu_open=True,
+                     model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)))
     assert await read_selected_model(page, timeout=1.0) == "GPT-5.6 Sol"
-    assert "chip" not in page.clicks  # never toggled it shut
-
-
-async def test_read_selected_model_ignores_a_stale_effort_submenu():
-    # A stale effort submenu would read "Pro" as a MODEL -> classify_served_audit
-    # returns menu_mismatch, killing a healthy run.
-    stale = _Menu("menu-effort-stale", state="closed", radio="Pro")
-    page = _FakeMenuPage(compact=True, extra_menus=[stale])
-    assert await read_selected_model(page, timeout=1.0) == "GPT-5.6 Sol"
+    assert "chip" not in page.clicks

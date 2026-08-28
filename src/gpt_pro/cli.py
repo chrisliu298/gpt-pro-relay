@@ -956,48 +956,58 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
     return ""
 
 
-# The 2026-08 redesign replaced the flat "Intelligence" effort list with a
-# TWO-LEVEL chip menu (verified live 2026-08-06):
+# The 2026-08-28 redesign REPLACED the two-level "Model/Effort" submenu with a
+# single flat menu (verified live 2026-08-28). Clicking COMPOSER_CHIP opens one
+# `[role=menu][data-state="open"]` (data-testid="composer-intelligence-picker-content"),
+# in its default `data-view="simple"`, containing:
 #
-#   [role=menu]                       <- opened by clicking COMPOSER_CHIP
-#     role=menuitem  aria-label="Power"      <- wraps a role=slider, 0..4
-#     role=menuitem  "Advanced"              <- toggle, see below
-#     role=menuitem  "Model\nGPT-5.6 Sol"    aria-haspopup=menu
-#     role=menuitem  "Effort\nPro"           aria-haspopup=menu
-#       └─ [role=menu] Instant / Medium / High / Extra High / Pro  (menuitemradio)
+#   [role=menu][data-state="open"]         <- opened by clicking COMPOSER_CHIP
+#     role=menuitem  aria-label="Power"    <- the interactive slider handle;
+#                                             wraps role=slider aria-valuemin=0
+#                                             aria-valuemax=4, aria-keyshortcuts
+#                                             "ArrowLeft ArrowRight". Effort tier
+#                                             = slider value: 0 Instant .. 4 Pro.
+#     role=menuitemradio  "GPT-5.6 Sol"    <- model list, FLAT in this menu (no
+#     role=menuitemradio  "GPT-5.5"           submenu). aria-checked marks the
+#                                             account default.
+#     role=menuitem  aria-label="Select model"  <- simple<->advanced view toggle
 #
-# The named effort leaves SURVIVED the redesign — they just moved one level
-# deeper, behind the "Effort" row. So selection stays a name-anchored
-# menuitemradio click rather than a slider drag: the slider would force us to
-# *infer* "top position == Pro" from a numeric index, whereas the radio lets us
-# read the tier we are selecting. (The slider is the same axis — it reads
-# "Pro, 5 of 5" once Pro is selected — it is simply the weaker signal.)
+# What changed and why the old code broke: the `aria-haspopup="menu"` "Model"/
+# "Effort" rows and the "Advanced" toggle are GONE. Effort became a slider, so
+# there is no `menuitemradio[name="Pro"]` to click any more — the old
+# `_open_chip_submenu(EFFORT_ROW)` timed out (chip_menuitem_missing →
+# model_select_failed). The model list is now readable directly from the open
+# menu with no submenu navigation.
 #
-# Two gotchas, both load-bearing:
-#   1. The Model/Effort rows sit behind the "Advanced" toggle, which resets to
-#      COMPACT on every page load (measured: the expanded state does not
-#      persist across a reload, unlike the effort selection itself). So every
-#      run must expand before it can reach the rows. The toggle's aria-label is
-#      directional — "Show advanced options" while compact, "Show compact
-#      options" while expanded — so keying on the expand label makes the click
-#      idempotent instead of a blind toggle that would collapse an already-open
-#      menu.
-#   2. The rows open on CLICK, not hover. Each row is a wrapper div whose inner
-#      button/span swallows pointer events, so Playwright's hover never lands
-#      ("subtree intercepts pointer events" — this is what silently broke the
-#      old hover-driven model read).
-PRO_LABEL = "Pro"
-ADVANCED_EXPAND_LABEL = "Show advanced options"  # present ONLY while compact
-MODEL_ROW = re.compile(r"Model")
-EFFORT_ROW = re.compile(r"Effort")
+# EFFORT SELECTION IS DRIVEN BY THE SLIDER (see `_drive_power_slider_to_max`):
+# CLICK the Power menuitem then press `End`. The click is load-bearing — a bare
+# focus()+ArrowRight moves aria-valuenow transiently but the selection REVERTS
+# on reload (verified live); clicking engages the committed interaction, and
+# `End` then drives to the max tier from any position. We verify by BOTH the
+# slider value (aria-valuenow == aria-valuemax, robust to tier renames / notch
+# count) AND the chip label reading `is_pro_label` after the menu closes (that
+# is what "the top tier is Pro" means, and it fails closed if the top tier ever
+# stops being labeled "Pro"). NB the chip renders the generic "Thinking effort"
+# label while the menu is OPEN and only shows the committed tier once it closes,
+# so the authoritative chip read must happen after dismissing the menu.
+OPEN_MENU = '[role="menu"][data-state="open"]'
+POWER_MENUITEM = f'{OPEN_MENU} [role="menuitem"][aria-label="Power"]'
 
+# Read the effort slider's current/max value from the open menu. Returns null if
+# the slider is absent (a selector break) so the caller fails closed rather than
+# hanging on a per-element actionability wait.
+SLIDER_STATE_JS = (
+    """(m) => { const s = m.querySelector('[role="slider"]');"""
+    """ return s ? {now: s.getAttribute('aria-valuenow'), max: s.getAttribute('aria-valuemax')} : null; }"""
+)
 
-# Ids of every *open* menu. Radix keeps a dismissed menu mounted through its
-# exit animation (`data-state="closed"`), so filtering on the state — not just
-# on `[role=menu]` — is what stops a closing menu counting as a live one.
-OPEN_MENU_IDS_JS = (
-    """() => Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))"""
-    """.map(m => m.id)"""
+# Read the checked model radio directly from the open menu. The model list is
+# flat now (no submenu), so a single querySelector suffices. Returns null when
+# no radio is checked (a selector break) → `read_selected_model` degrades to
+# None → the fail-OPEN `unverified_missing_slug` verdict.
+SELECTED_MODEL_JS = (
+    """(m) => { const r = m.querySelector('[role="menuitemradio"][aria-checked="true"]');"""
+    """ return r ? (r.innerText || '').trim() : null; }"""
 )
 
 
@@ -1006,94 +1016,78 @@ async def _open_chip_menu(page, chip, *, timeout: float = 5.0) -> None:
 
     The chip is a TOGGLE: clicking it while `aria-expanded="true"` closes the
     menu. A caller that clicks unconditionally therefore inverts the state
-    whenever it enters with the menu already open, leaving only menus in their
-    exit animation for `_open_chip_submenu` to resolve. Reproduced live:
-    `read_selected_model` called straight after `ensure_pro_chip` (which returns
-    with its menu still open) read the model as None — and a None model read is
-    the fail-OPEN `unverified_missing_slug` verdict, so this silently weakens
-    the missing-slug backstop rather than announcing itself.
+    whenever it enters with the menu already open, leaving only a menu in its
+    exit animation behind. Reproduced live: `read_selected_model` called
+    straight after `ensure_pro_chip` (which used to return with its menu open)
+    read the model as None — and a None model read is the fail-OPEN
+    `unverified_missing_slug` verdict, so this silently weakens the missing-slug
+    backstop rather than announcing itself.
 
     Production does not hit that ordering today (the composer click between them
     dismisses the menu), so this guard is about not depending on that accident.
     """
     if await chip.get_attribute("aria-expanded") != "true":
         await chip.click(timeout=timeout * 1000)
-    await page.wait_for_selector('[role="menu"]', timeout=timeout * 1000)
+    await page.wait_for_selector(OPEN_MENU, timeout=timeout * 1000)
 
 
-async def _open_chip_submenu(page, row_pattern, *, timeout: float = 5.0):
-    """Open the chip menu's "Model" or "Effort" submenu; return its locator.
+async def _drive_power_slider_to_max(page, *, timeout: float = 5.0, settle: float = 1.2) -> bool:
+    """Drive the composer's Power (effort) slider to its maximum tier (Pro).
 
-    Assumes the chip menu itself is already open. Expands the "Advanced" toggle
-    first (no-op when already expanded, since the expand-label locator only
-    matches in the compact state).
+    Assumes the chip menu is already open in its default "simple" (slider) view.
+    Returns True once the slider reports `aria-valuenow == aria-valuemax`.
 
-    Expansion is deliberately BEST-EFFORT: a relabelled toggle must not brick
-    the *send* path, whose own gate is fail-closed (`ensure_pro_chip` returns
-    False → `model_select_failed`, and the chip must still read `is_pro_label`).
-    Note this is NOT true of the other caller: `read_selected_model` degrades to
-    None, which `classify_served_audit` treats as `unverified_missing_slug` —
-    a deliberate fail-OPEN. So a swallowed failure here weakens the missing-slug
-    backstop rather than tripping a gate; that is the accepted cost of not
-    bricking on a cosmetic relabel, not a claim that everything downstream
-    fails closed.
+    The slider's interactive element is the `[aria-label="Power"]` menuitem (the
+    inner `role=slider` node is `tabindex=-1 aria-hidden`). CLICKING it is what
+    engages the committed interaction — a bare `focus()`+ArrowRight moves
+    `aria-valuenow` transiently but the selection reverts on reload (verified
+    live 2026-08-28). `End` then drives to the top tier from any starting
+    position. We re-press each poll and re-read the slider value from the open
+    menu (via `SLIDER_STATE_JS`, not a per-element `get_attribute` that would
+    block on actionability if the slider vanished). Bounded by `timeout` so a
+    selector break fails closed instead of hanging.
 
-    IDENTIFYING THE SUBMENU IS THE SAFETY-CRITICAL PART. A global
-    `[role=menu].last` (or a bare count >= 2) asks only whether *some* second
-    menu exists, not whether it is the one this row owns. That is reachable, not
-    theoretical: a menu dismissed a moment earlier stays in the DOM through its
-    exit animation, so `.last` can resolve a stale menu — observed live, where a
-    `read_selected_model` call entered with menus still open and returned None.
-    Both misreads are bad in different directions:
-
-      - resolving the MAIN menu → it holds a slider and NO checked
-        `menuitemradio` (2026-08), so the read yields None → the fail-OPEN
-        `unverified_missing_slug` verdict, silently losing the backstop;
-      - resolving a stale EFFORT submenu → reads "Pro" as if it were a model
-        name → `menu_mismatch`, a FATAL verdict on a healthy run.
-
-    So resolve by ownership: Radix links an open row to its submenu with
-    `aria-controls` -> the menu's `id` (and back via `aria-labelledby`). Prefer
-    that link; fall back to "the menu that newly OPENED as a result of this
-    click", which excludes both the main menu and any pre-existing stale one
-    without depending on a Radix attribute name. Raise if neither resolves, so
-    callers fail closed rather than read an arbitrary menu.
+    `settle`: after reaching max, wait briefly before returning. The effort is
+    saved to the account preference ASYNChronously; the in-page value is correct
+    immediately (and that is all the same-page send path needs — verified 6/6),
+    but a page RELOAD racing that save can hydrate to the previous tier (measured
+    ~50% at settle=0, 5/5 persisted at settle>=1s, 2026-08-28). The settle lets
+    the save flush so `doctor`'s fresh-page read and the next run's fast-path
+    detection stay stable. Only spent on the rare slow-path correction.
     """
-    expand = page.locator(
-        f'[role="menu"] [role="menuitem"][aria-label="{ADVANCED_EXPAND_LABEL}"]'
-    )
-    try:
-        if await expand.count():
-            await expand.first.click(timeout=timeout * 1000)
-    except Exception:
-        pass  # best-effort: the row may already be reachable
-
-    row = (
-        page.locator('[role="menu"] [role="menuitem"][aria-haspopup="menu"]')
-        .filter(has_text=row_pattern)
-        .first
-    )
-    # Menus already open BEFORE this click — the main menu plus anything stale.
-    # Whatever we return must not be one of these.
-    preexisting = set(await page.evaluate(OPEN_MENU_IDS_JS))
-
-    # Re-entrancy: clicking a row that is already expanded COLLAPSES it. Read
-    # the owned menu instead of toggling it shut.
-    if await row.get_attribute("aria-expanded") != "true":
-        await row.click(timeout=timeout * 1000)
-
+    power = page.locator(POWER_MENUITEM).first
+    menu = page.locator(OPEN_MENU).first
+    await power.click(timeout=timeout * 1000)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        controls = await row.get_attribute("aria-controls")
-        if controls:
-            owned = page.locator(f'[role="menu"][id="{controls}"][data-state="open"]')
-            if await owned.count() == 1:
-                return owned
-        fresh = [i for i in await page.evaluate(OPEN_MENU_IDS_JS) if i not in preexisting]
-        if len(fresh) == 1:
-            return page.locator(f'[role="menu"][id="{fresh[0]}"]')
-        await asyncio.sleep(0.1)
-    raise RuntimeError(f"chip submenu {row_pattern.pattern!r} did not open")
+        await page.keyboard.press("End")
+        await asyncio.sleep(0.2)
+        state = await menu.evaluate(SLIDER_STATE_JS)
+        if state and state.get("now") is not None and state.get("now") == state.get("max"):
+            if settle > 0:
+                await asyncio.sleep(settle)
+            return True
+    return False
+
+
+async def _close_chip_menu(page, chip) -> None:
+    """Dismiss the chip menu before an authoritative chip read.
+
+    The chip renders the generic "Thinking effort" label while the menu is OPEN
+    and only shows the committed effort tier once it closes, so the chip must be
+    dismissed before `is_pro_label` can be trusted. Escape closes the Radix
+    menu; if it misses, toggling the chip closes it (checked via aria-expanded so
+    we never re-open an already-closed menu). Best-effort — a failure here just
+    leaves the subsequent chip poll to fail closed.
+    """
+    try:
+        if await chip.get_attribute("aria-expanded") == "true":
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+        if await chip.get_attribute("aria-expanded") == "true":
+            await chip.click(timeout=5000)
+    except Exception:
+        pass
 
 
 async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
@@ -1105,13 +1099,12 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
 
     Slow path (chip in a wrong effort): held under `UiClipboardLock` plus a
     `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
-    and `keyboard.press("Escape")` on cleanup paths can close the wrong menu if a
-    concurrent worker brings its tab to front. It opens the chip menu, drills
-    into the "Effort" submenu (see `_open_chip_submenu`) and clicks the "Pro"
-    effort leaf (role='menuitemradio'). It does NOT touch the model submenu —
-    the model comes from the account default and is verified fail-closed
-    post-send by the served-slug audit; self-correcting it here would add a
-    second submenu navigation for a rare drift the audit already catches.
+    and `keyboard.press` on it can steal focus from a concurrent worker's tab. It
+    opens the chip menu and drives the Power effort slider to its top (Pro) tier
+    (see `_drive_power_slider_to_max`). It does NOT touch the model radios — the
+    model comes from the account default and is verified fail-closed post-send by
+    the served-slug audit; self-correcting it here would add work for a rare
+    drift the audit already catches.
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
@@ -1130,23 +1123,31 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
             log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
             return False, text
 
-        # Drill into the "Effort" submenu, then click the "Pro" leaf. Anchor the
-        # regex so a future relabel doesn't silently match (an intentional
-        # product change worth reviewing rather than auto-accepting).
+        # Drive the Power effort slider to its top (Pro) tier. The named effort
+        # radios are gone (2026-08-28 redesign); effort is now a slider whose max
+        # tier is Pro. `reached_max` is the slider-value check (aria-valuenow ==
+        # aria-valuemax); the chip-label check below is the second, name-anchored
+        # gate. Both must pass, so we fail closed if either the slider does not
+        # max OR the top tier is no longer labeled "Pro".
         try:
-            submenu = await _open_chip_submenu(page, EFFORT_ROW)
-            item = submenu.get_by_role(
-                "menuitemradio", name=re.compile(rf"^{re.escape(PRO_LABEL)}$")
-            )
-            await item.first.click(timeout=5000)
+            reached_max = await _drive_power_slider_to_max(page)
         except Exception as e:
             await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
             (run_dir / "error.html").write_text(await page.content())
             log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
             await page.keyboard.press("Escape")
             return False, text
+        if not reached_max:
+            await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
+            (run_dir / "error.html").write_text(await page.content())
+            log_stage("error", reason="chip_menuitem_missing", detail="power_slider_not_max")
+            await page.keyboard.press("Escape")
+            return False, text
 
-        # Poll up to 5s for the chip text to settle on the "Pro" effort label.
+        # Dismiss the menu, then confirm the chip settled on the "Pro" tier — the
+        # chip shows "Thinking effort" while the menu is open, so this read must
+        # follow the close. Poll up to 5s for it to settle.
+        await _close_chip_menu(page, chip)
         deadline = time.time() + 5.0
         final_text = text
         while time.time() < deadline:
@@ -1212,23 +1213,22 @@ def classify_served_audit(served_slug: str | None, menu_model: str | None) -> st
 async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
     """Return the currently-selected model's label from the chip menu, or None.
 
-    Read-only diagnostic (no selection, no send). Opens the chip menu, drills
-    into the "Model" submenu (`_open_chip_submenu` — which expands "Advanced"
-    and CLICKS the row; the pre-2026-08 hover never lands on the new wrapper
-    rows) and reads its checked model radio. Returns None on any failure so
-    `doctor` degrades to "unknown" rather than erroring. Always closes the menu
-    with Escape.
+    Read-only diagnostic (no selection, no send). Opens the chip menu and reads
+    the checked model radio directly — the 2026-08-28 redesign flattened the
+    model list into the chip menu itself (`SELECTED_MODEL_JS`), so there is no
+    longer a "Model" submenu to drill into. Returns None on any failure (no
+    checked radio, an unreadable menu) so `doctor` degrades to "unknown" and the
+    served-slug audit fallback degrades to the fail-OPEN `unverified_missing_slug`
+    rather than erroring. Always closes the menu with Escape.
     """
     chip = page.locator(COMPOSER_CHIP).first
     try:
         await _open_chip_menu(page, chip, timeout=timeout)
-        submenu = await _open_chip_submenu(page, MODEL_ROW, timeout=timeout)
+        menu = page.locator(OPEN_MENU).first
         deadline = time.time() + 3.0
         model = None
         while time.time() < deadline:
-            model = await submenu.evaluate(
-                """m => { const r = m.querySelector('[role="menuitemradio"][aria-checked="true"]'); return r ? (r.innerText || '').trim() : null; }"""
-            )
+            model = await menu.evaluate(SELECTED_MODEL_JS)
             if model:
                 break
             await asyncio.sleep(0.2)
@@ -2283,11 +2283,11 @@ async def _install_beacon_modal_dismisser(page) -> None:
         inside the handler); both captures show one `#modal-beacon` and one
         close button page-wide, so it selects nothing in practice. Its untested
         edge, flagged by review and left as-is: if Radix ever leaves a *stale*
-        close button mounted ahead of the live one — the exit-animation pattern
-        the chip-submenu note warns about — `.first` resolves the stale node and
-        the handler goes inert (fail-open, a stall) or waits on a node that never
-        hides. Neither capture shows that state; if one ever does, resolve by
-        ownership as `_open_chip_submenu` does rather than swapping in `.last`.
+        close button mounted ahead of the live one — an exit-animation race —
+        `.first` resolves the stale node and the handler goes inert (fail-open,
+        a stall) or waits on a node that never hides. Neither capture shows that
+        state; if one ever does, resolve by ownership (match the live element's
+        own attributes) rather than swapping in `.last`.
       - **Close, never the CTA.** The dialog's primary button ("Get started")
         also dismisses it, but it navigates/opts in. Scoping the close button
         *inside* the beacon likewise keeps a same-test-id button in some other
