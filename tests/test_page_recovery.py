@@ -394,7 +394,7 @@ async def test_monitor_completes_and_audits(_finalize_env, tmp_path):
         return "the answer (markdown)"
 
     async def _slug(_page):
-        return "gpt-5-6-pro"
+        return "gpt-6-pro"
 
     _finalize_env.setattr(cli, "read_latest_assistant_text", _text)
     _finalize_env.setattr(cli, "_stop_button_count", _stop)
@@ -608,7 +608,7 @@ async def test_monitor_past_deadline_times_out_without_fresh_budget(_finalize_en
     import asyncio
 
     async def _slug(_page):
-        return "gpt-5-6-pro"
+        return "gpt-6-pro"
 
     _finalize_env.setattr(cli, "served_assistant_model_slug", _slug)
     page = _FinalizePage()
@@ -699,7 +699,7 @@ def _artifacts(run_dir):
 
 async def test_monitor_publishes_canonical_only_when_verified_and_complete(_finalize_env, tmp_path):
     _fake_turn(_finalize_env, text="the answer", copied="the answer (markdown)",
-               slug="gpt-5-6-pro")
+               slug="gpt-6-pro")
     result = await _finalize(tmp_path)
     assert result["status"] == "ok"
     assert result["model_audit"] == "verified"
@@ -713,7 +713,7 @@ async def test_monitor_quarantines_attachment_acknowledgement(_finalize_env, tmp
         "我将继续给出完整技术评审。"
     )
     _fake_turn(_finalize_env, text=acknowledgement,
-               copied=acknowledgement, slug="gpt-5-6-pro")
+               copied=acknowledgement, slug="gpt-6-pro")
 
     result = await _finalize(tmp_path, instruction_boundary_restored=True)
 
@@ -724,7 +724,7 @@ async def test_monitor_quarantines_attachment_acknowledgement(_finalize_env, tmp
 
 
 async def test_monitor_does_not_quarantine_legitimate_short_attached_answer(_finalize_env, tmp_path):
-    _fake_turn(_finalize_env, text="4", copied="4", slug="gpt-5-6-pro")
+    _fake_turn(_finalize_env, text="4", copied="4", slug="gpt-6-pro")
 
     result = await _finalize(tmp_path, instruction_boundary_restored=True)
 
@@ -738,7 +738,7 @@ async def test_monitor_scopes_ack_guard_to_attachment_boundary(_finalize_env, tm
     # user turn.
     acknowledgement = "I received the attached file. Tell me the task and I will continue."
     _fake_turn(_finalize_env, text=acknowledgement,
-               copied=acknowledgement, slug="gpt-5-6-pro")
+               copied=acknowledgement, slug="gpt-6-pro")
 
     result = await _finalize(tmp_path, instruction_boundary_restored=False)
 
@@ -766,7 +766,7 @@ async def test_monitor_quarantines_answer_on_model_mismatch(_finalize_env, tmp_p
 
 
 async def test_monitor_quarantines_answer_on_menu_mismatch(_finalize_env, tmp_path):
-    # Same quarantine on the slug-absent branch: the menu confirmed a non-Sol
+    # Same quarantine on the slug-absent branch: the menu confirmed an old
     # model, equally fatal and equally salvageable off disk.
     _fake_turn(_finalize_env, text="wrong-model answer",
                copied="wrong-model answer (markdown)", slug=None, menu="GPT-5.5")
@@ -811,7 +811,7 @@ async def test_monitor_timeout_publishes_partial_not_canonical(_finalize_env, tm
     # the canonical name. Needs a live budget: the monitor loop has to actually
     # run to accumulate text.
     rendered = "A complete-looking answer. " * 20
-    _fake_turn(_finalize_env, text=rendered, copy_present=False, slug="gpt-5-6-pro")
+    _fake_turn(_finalize_env, text=rendered, copy_present=False, slug="gpt-6-pro")
     result = await _finalize(tmp_path, budget=0.25)
     assert result["status"] == "timeout"
     assert result["exit_code"] == 3
@@ -834,7 +834,7 @@ async def test_postsend_recovery_across_attempts_publishes_one_artifact(_finaliz
         audits["n"] += 1
         if audits["n"] == 1:
             raise RunPageClosed()
-        return "gpt-5-6-pro"
+        return "gpt-6-pro"
 
     async def _nav_ok(_ctx, _page, _url, *, deadline):
         return None

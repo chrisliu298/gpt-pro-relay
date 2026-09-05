@@ -8,9 +8,9 @@ catching the optimistic-hydration transient. These tests pin the stability
 behavior that fixes it: the chip text must repeat for `stable_polls` reads
 before it is trusted.
 
-Since the 2026-07 GPT-5.6 redesign the chip shows the reasoning-EFFORT tier
-only (Instant / Medium / High / Extra High / Pro); the model ("GPT-5.6 Sol",
-served slug gpt-5-6-pro) is a separate axis verified post-send. The predicate
+Since the 2026-09 GPT-6 rollout the chip shows the model generation plus the
+reasoning-EFFORT tier (for example, "6\nPro"); the selected model radio is
+"Latest", and the served slug is gpt-6-pro. The predicate
 `is_pro_label` accepts any chip containing the "Pro" (top-tier) token; the same
 optimistic-hydrate → re-resolve race can now drift the effort from "Pro" down to
 a lower tier, so the stability requirement still applies.
@@ -123,6 +123,7 @@ def test_pro_label_passes_predicate():
     # The 2026-07 redesign renders the selected top-tier effort as the bare
     # label "Pro" (contains the "Pro" token).
     assert is_pro_label("Pro")
+    assert is_pro_label("6\nPro")
 
 
 def test_lower_effort_tiers_fail_predicate():
@@ -140,11 +141,11 @@ async def test_steady_pro_passes_with_explicit_stable_polls():
 
 
 def test_classify_model_status():
-    # doctor's read-only model check: the account default must be GPT-5.6 Sol.
-    assert classify_model_status("GPT-5.6 Sol") == "ok"
-    # A confirmed non-Sol model must be flagged so doctor goes red (the status
+    # GPT-6 is exposed through the selected "Latest" model row.
+    assert classify_model_status("Latest") == "ok"
+    # A confirmed non-Latest model must be flagged so doctor goes red (the status
     # is later matched with .startswith("unexpected")).
-    for wrong in ("GPT-5.5", "GPT-5.4", "o3", "GPT-5.3"):
+    for wrong in ("GPT-5.6 Sol", "GPT-5.5", "GPT-5.4", "o3", "GPT-5.3"):
         assert classify_model_status(wrong).startswith("unexpected")
     # An unreadable menu degrades to a non-fatal "unknown" (not "unexpected"),
     # so a flaky Radix read never fails doctor on its own.
@@ -153,7 +154,7 @@ def test_classify_model_status():
 
 
 def test_doctor_exit_ok_requires_positive_confirmation():
-    # Green ONLY when login + Pro effort chip + Sol model are all confirmed.
+    # Green ONLY when login + Pro effort chip + Latest model are all confirmed.
     assert doctor_exit_ok(True, "ok", "ok")
     # A confirmed wrong effort or wrong model is red.
     assert not doctor_exit_ok(True, "unexpected: 'High'", "ok")
@@ -169,13 +170,14 @@ def test_doctor_exit_ok_requires_positive_confirmation():
 
 def test_classify_served_audit():
     # Present slug is authoritative (encodes model + effort).
-    assert classify_served_audit("gpt-5-6-pro", None) == "verified"
-    # A present non-allowlisted slug is fatal — including a Sol effort DOWNGRADE
-    # (High effort stamps gpt-5-6-thinking) and any older model.
+    assert classify_served_audit("gpt-6-pro", None) == "verified"
+    # A present non-allowlisted slug is fatal, including the previous Pro model.
     assert classify_served_audit("gpt-5-6-thinking", None) == "slug_mismatch"
+    assert classify_served_audit("gpt-5-6-pro", None) == "slug_mismatch"
     assert classify_served_audit("gpt-5-5-pro", None) == "slug_mismatch"
     # Missing slug → fall back to the read-only menu model read.
-    assert classify_served_audit(None, "GPT-5.6 Sol") == "model_ok_slug_missing"
+    assert classify_served_audit(None, "Latest") == "model_ok_slug_missing"
+    assert classify_served_audit(None, "GPT-5.6 Sol") == "menu_mismatch"
     assert classify_served_audit(None, "GPT-5.5") == "menu_mismatch"  # fatal
     # Missing slug AND unreadable menu → documented fail-open (never bricks).
     assert classify_served_audit(None, None) == "unverified_missing_slug"
@@ -185,6 +187,6 @@ def test_classify_served_audit():
     assert classify_served_audit("", "GPT-5.5") == "menu_mismatch"
     # Only "slug_mismatch"/"menu_mismatch" are the fatal verdicts.
     fatal = {"slug_mismatch", "menu_mismatch"}
-    assert classify_served_audit("gpt-5-6-pro", None) not in fatal
-    assert classify_served_audit(None, "GPT-5.6 Sol") not in fatal
+    assert classify_served_audit("gpt-6-pro", None) not in fatal
+    assert classify_served_audit(None, "Latest") not in fatal
     assert classify_served_audit(None, None) not in fatal

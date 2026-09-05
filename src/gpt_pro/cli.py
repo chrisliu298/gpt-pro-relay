@@ -867,43 +867,33 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
-# Composer chip shows the reasoning-EFFORT tier only. Since the 2026-07 GPT-5.6
-# redesign the model and effort are separate axes: the chip renders the effort
-# tier (Instant / Medium / High / Extra High / Pro) and the model lives on its
-# own submenu ("GPT-5.6 Sol"). The desired effort is the top "Pro" tier, which
-# the chip renders as the bare label "Pro". The chip exposes NO model-axis signal
-# (no aria-label, no dataset, no hidden mirror that differs from innerText), so
-# the model is invisible here — the pre-send chip verifies the *effort* and the
-# post-send served-slug audit verifies the *model*. See `is_pro_label`.
+# Since the 2026-09 GPT-6 rollout the composer chip renders the model generation
+# and effort together ("6\nPro"). The selected model radio is the rolling label
+# "Latest"; older pinned models remain separate radios. The pre-send chip still
+# gates on the top "Pro" effort, while the post-send slug is the authoritative
+# model identity. See `is_pro_label` and `classify_served_audit`.
 COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
 PRO_TOKEN = "Pro"
 # Ground-truth model slug stamped on the served assistant turn
 # (data-message-model-slug). This is the only *authoritative* model signal, but
 # it only exists after Send, so it backstops the pre-send chip gate rather than
 # replacing it. See served_assistant_model_slug / the post-completion audit.
-# An explicit allowlist (not a prefix test): a prefix like "gpt-5-6" would
-# wrongly accept a hypothetical non-Pro "gpt-5-6-mini". If OpenAI ships a new
-# Pro-family slug, add it here — a one-line, deliberate edit. NOTE the UI display
-# name and the slug diverge: "GPT-5.6 Sol" + Pro effort serves as `gpt-5-6-pro`
-# (verified 2026-07-09 via a live send). The served slug encodes the effort tier
-# too, not just the model: Sol at Pro effort → `gpt-5-6-pro`, but Sol at High
-# effort → `gpt-5-6-thinking` (measured 2026-07-09). So on a *present* slug the
-# audit catches an effort downgrade as well as a model swap — only Pro-on-Sol
-# maps into this allowlist. The pre-send chip ("Pro") is a fast fail; the slug is
-# authoritative. The one thing neither can see is a *missing* slug (fail-open).
-PRO_MODEL_SLUGS = frozenset({"gpt-5-6-pro"})
+# An explicit allowlist (not a prefix test): a prefix like "gpt-6" could accept
+# a hypothetical non-Pro variant. GPT-6 + Pro was observed live as `gpt-6-pro`
+# on 2026-09-05. A present slug verifies both axes and catches an effort
+# downgrade or old-model selection. A missing slug remains fail-open, backed by
+# the selected-model radio check below.
+PRO_MODEL_SLUGS = frozenset({"gpt-6-pro"})
 
 
 def is_pro_label(text: str | None) -> bool:
     """Predicate: chip text indicates the top "Pro" reasoning-effort tier.
 
-    The composer chip shows the effort tier only (Instant / Medium / High /
-    Extra High / Pro). "Pro" is the highest tier and the only one containing the
-    "Pro" token, so a substring test uniquely identifies it — model names never
-    appear in the chip. This verifies *effort*, not model: the model
-    ("GPT-5.6 Sol", served slug gpt-5-6-pro) is verified post-send by the
-    served-slug audit. Substring (not exact) matching per the redesign-resilience
-    convention — ChatGPT relabels this chip across redesigns.
+    "Pro" is the highest tier and the only one containing the "Pro" token, so a
+    substring test accepts both the old bare "Pro" label and GPT-6's "6\nPro"
+    chip. This verifies *effort*; `gpt-6-pro` is verified post-send by the served-
+    slug audit. Substring (not exact) matching follows the existing redesign-
+    resilience convention.
     """
     return bool(text) and PRO_TOKEN in text
 
@@ -915,7 +905,7 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
     """Read the composer chip's text after React hydration *and* settle.
 
     The chip's SSR text is 'Model'; hydration replaces it with the user's
-    selected effort tier ('Pro', 'High', 'Auto', etc.). We poll until the
+    selection label ('6\nPro', 'High', 'Auto', etc.). We poll until the
     placeholder is gone — reading too early would cause a self-correction click
     on an unhydrated chip, which doesn't open the menu.
 
@@ -967,9 +957,9 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
 #                                             aria-valuemax=4, aria-keyshortcuts
 #                                             "ArrowLeft ArrowRight". Effort tier
 #                                             = slider value: 0 Instant .. 4 Pro.
-#     role=menuitemradio  "GPT-5.6 Sol"    <- model list, FLAT in this menu (no
-#     role=menuitemradio  "GPT-5.5"           submenu). aria-checked marks the
-#                                             account default.
+#     role=menuitemradio  "Latest"         <- model list, FLAT in this menu (no
+#     role=menuitemradio  "GPT-5.6 Sol"       submenu). aria-checked marks the
+#     role=menuitemradio  "GPT-5.5"           account default.
 #     role=menuitem  aria-label="Select model"  <- simple<->advanced view toggle
 #
 # What changed and why the old code broke: the `aria-haspopup="menu"` "Model"/
@@ -1095,7 +1085,7 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
 
     Idempotent fast path: if the chip already reads `is_pro_label` we no-op
     without taking any lock — the typical case, since a fresh page defaults to
-    Sol+Pro.
+    GPT-6 Pro.
 
     Slow path (chip in a wrong effort): held under `UiClipboardLock` plus a
     `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
@@ -1158,33 +1148,32 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
         return False, final_text
 
 
-# The selected MODEL is invisible in the chip — it's the checked radio inside the
-# chip menu's model submenu. `doctor` reads it to confirm the account default is
-# GPT-5.6 Sol; the worker send path does NOT (its authoritative model gate is the
-# served-slug audit). This closes the diagnostic gap the effort-only chip opened:
-# without it, `doctor` reports green on a wrong model whose default has drifted.
-SOL_MODEL_TOKEN = "Sol"  # distinctive substring: no other model row contains it
+# GPT-6 is currently exposed through the rolling "Latest" model radio (the menu
+# header and closed chip display "6"). Older pinned models remain separate rows.
+# The worker uses the authoritative served slug; doctor checks this exact label
+# so a profile deliberately pinned to an older model is red.
+PRO_MODEL_MENU_LABELS = frozenset({"Latest"})
 
 
 def classify_model_status(model_text: str | None) -> str:
     """Classify a read model label for `doctor`. `None` (unreadable menu) →
-    "unknown"; a label containing "Sol" → "ok"; anything else →
+    "unknown"; GPT-6's rolling "Latest" label → "ok"; anything else →
     "unexpected: <label>" (a confirmed wrong model)."""
     if model_text is None:
         return "unknown"
-    if SOL_MODEL_TOKEN in model_text:
+    if model_text in PRO_MODEL_MENU_LABELS:
         return "ok"
     return f"unexpected: {model_text!r}"
 
 
 def doctor_exit_ok(logged_in: bool, chip_status: str, model_status: str) -> bool:
-    """`doctor` succeeds only when login, the Pro-effort chip, AND the Sol model
+    """`doctor` succeeds only when login, the Pro-effort chip, AND GPT-6's model
     are all POSITIVELY confirmed ("ok"). Anything else — a wrong effort/model
     ("unexpected: ..."), an unreadable chip/menu ("unknown"/"failed"), or the
     not-logged-in "skipped" — is NOT a confirmation, so doctor goes red. doctor
     is a diagnostic, not the hot path: a read failure surfacing as non-green (the
     operator re-runs) is correct, whereas a false green would defeat doctor's
-    whole purpose of catching a setup drifted off GPT-5.6 Sol + Pro."""
+    whole purpose of catching a setup drifted off GPT-6 + Pro."""
     return logged_in and chip_status == "ok" and model_status == "ok"
 
 
@@ -1194,11 +1183,11 @@ def classify_served_audit(served_slug: str | None, menu_model: str | None) -> st
     stamped turn. When it's absent, `menu_model` (a read-only chip-menu model
     read, the fallback) is the independent backstop. Verdicts:
 
-    - "verified"            — slug present and in `PRO_MODEL_SLUGS` (Sol+Pro).
+    - "verified"            — slug present and in `PRO_MODEL_SLUGS` (GPT-6 Pro).
     - "slug_mismatch"       — slug present but not allowlisted → FATAL.
-    - "menu_mismatch"       — slug absent, menu confirms a non-Sol model → FATAL
+    - "menu_mismatch"       — slug absent, menu confirms a non-Latest model → FATAL
                               (closes the missing-slug wrong-model hole).
-    - "model_ok_slug_missing" — slug absent, menu confirms Sol → fail-OPEN, but
+    - "model_ok_slug_missing" — slug absent, menu confirms Latest → fail-OPEN, but
                               model is confirmed (effort stays unverified).
     - "unverified_missing_slug" — slug absent AND menu unreadable → fail-OPEN
                               (a double selector break must not brick the tool).
@@ -1207,7 +1196,7 @@ def classify_served_audit(served_slug: str | None, menu_model: str | None) -> st
         return "verified" if served_slug in PRO_MODEL_SLUGS else "slug_mismatch"
     if menu_model is None:
         return "unverified_missing_slug"
-    return "model_ok_slug_missing" if SOL_MODEL_TOKEN in menu_model else "menu_mismatch"
+    return "model_ok_slug_missing" if menu_model in PRO_MODEL_MENU_LABELS else "menu_mismatch"
 
 
 async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
@@ -1294,14 +1283,14 @@ async def _cmd_doctor_with_browser() -> int:
                     chip_status = "ok" if is_pro_label(chip_text) else f"unexpected: {chip_text!r}"
                 except Exception as e:
                     chip_status = f"failed: {type(e).__name__}: {e}"
-                # Read the selected model (read-only) so a default drifted off Sol
+                # Read the selected model so a default drifted off Latest/GPT-6
                 # is visible — the effort chip alone can't reveal it.
                 try:
                     model_text = await read_selected_model(page, timeout=10.0)
                     model_status = classify_model_status(model_text)
                 except Exception as e:
                     model_status = f"failed: {type(e).__name__}: {e}"
-            # doctor is green ONLY when login + Pro effort + Sol model are all
+            # doctor is green ONLY when login + Pro effort + GPT-6 model are all
             # positively confirmed; a wrong OR unconfirmable chip/model is red.
             checks_ok = doctor_exit_ok(ok, chip_status, model_status)
             result = {
@@ -3194,7 +3183,7 @@ def main() -> int:
     close_p.add_argument("--force", action="store_true",
                          help="Kill Chrome even while in use. Active workers/login/doctor lose their CDP connection.")
 
-    ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT GPT-5.6 Sol Pro. Prints response on stdout when ready.")
+    ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT GPT-6 Pro. Prints response on stdout when ready.")
     ask_p.add_argument("--run-id", default=None,
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,

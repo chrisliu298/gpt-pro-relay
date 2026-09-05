@@ -22,7 +22,7 @@ remote ──ssh──▶ Mac ──[parent: ask]
                       [worker: _run] ──Playwright──▶ Chrome (persistent profile)
                        │                                          │
                        │ <── poll result.json ──┐                 ▼
-                       │                        │      chatgpt.com / GPT-5.6 Sol / Pro
+                       │                        │      chatgpt.com / GPT-6 / Pro
                        ▼                        │                 │
                   response on stdout            └─── result.json ◀┘
                   JSON status on stderr
@@ -47,7 +47,7 @@ uv run gpt-pro-relay login     # opens Chrome Beta; sign in to ChatGPT manually
 
 **Launch Chrome Beta once interactively before the relay ever touches it.** macOS asks for approval the first time you open freshly downloaded software, and that prompt appears on the Mac's own screen — an SSH-detached worker cannot answer it. Get it out of the way while a human is present. See [Troubleshooting](#a-newly-installed-chrome-never-binds-the-cdp-port) if the relay hangs on a new Chrome anyway.
 
-Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **GPT-5.6 Sol** + **Pro** once so the account preference is set.
+Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **Latest (GPT-6)** + **Pro** once so the account preference is set.
 
 The default app is `/Applications/Google Chrome Beta.app`. `GPT_PRO_CHROME_APP` may select a Chrome Dev or Canary app with a recognized side-by-side bundle identity, but the relay rejects Stable Chrome's `com.google.Chrome` bundle identity instead of silently recreating the Dock conflict. Existing installations that previously used Stable should migrate while no workers are running:
 
@@ -80,7 +80,7 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 | Command | What it does |
 |---|---|
 | `gpt-pro-relay login` | Open the isolated Chrome Beta app at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
-| `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **GPT-5.6 Sol** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
+| `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **Latest (GPT-6)** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
 | `gpt-pro-relay ask [--run-id ID] [--no-wait] [--generation-timeout SECONDS] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits indefinitely for completion and prints the response on stdout. `--generation-timeout` optionally bounds only this parent wait; it never stops the detached worker. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses while a worker, `login`, or `doctor` holds a browser activity lease; pass `--force` to kill anyway (active users lose their CDP connection). |

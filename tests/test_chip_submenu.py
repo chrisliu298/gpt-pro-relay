@@ -9,7 +9,8 @@ with a single flat menu. Clicking the composer chip
       role=menuitem  aria-label="Power"       <- the effort slider handle;
                                                  wraps role=slider 0..4
                                                  (0 Instant .. 4 Pro)
-      role=menuitemradio  "GPT-5.6 Sol"        <- model list, FLAT (no submenu)
+      role=menuitemradio  "Latest"             <- GPT-6; model list is FLAT
+      role=menuitemradio  "GPT-5.6 Sol"
       role=menuitemradio  "GPT-5.5"
       role=menuitem  aria-label="Select model" <- view toggle
 
@@ -124,7 +125,7 @@ class _FakePage:
         menu_open=False,
         has_slider=True,
         slider_maxes=True,
-        model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)),
+        model_radios=(("Latest", True), ("GPT-5.6 Sol", False)),
         chip_settles_pro=True,
     ):
         self.slider_value = slider_value
@@ -314,14 +315,14 @@ class _MonkeyChipText:
 
 async def test_read_selected_model_reads_checked_radio(tmp_path):
     page = _FakePage(menu_open=False,
-                     model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)))
-    assert await read_selected_model(page, timeout=1.0) == "GPT-5.6 Sol"
+                     model_radios=(("Latest", True), ("GPT-5.6 Sol", False)))
+    assert await read_selected_model(page, timeout=1.0) == "Latest"
 
 
 async def test_read_selected_model_reads_a_drifted_default(tmp_path):
     # A default drifted to GPT-5.5 must be reported (so doctor/audit can flag it).
     page = _FakePage(menu_open=False,
-                     model_radios=(("GPT-5.6 Sol", False), ("GPT-5.5", True)))
+                     model_radios=(("Latest", False), ("GPT-5.5", True)))
     assert await read_selected_model(page, timeout=1.0) == "GPT-5.5"
 
 
@@ -329,7 +330,7 @@ async def test_read_selected_model_returns_none_when_no_radio_checked(tmp_path):
     # No checked radio (selector break) -> None -> unverified_missing_slug
     # (fail-open) / doctor "unknown".
     page = _FakePage(menu_open=False,
-                     model_radios=(("GPT-5.6 Sol", False), ("GPT-5.5", False)))
+                     model_radios=(("Latest", False), ("GPT-5.5", False)))
     assert await read_selected_model(page, timeout=0.3) is None
 
 
@@ -346,6 +347,6 @@ async def test_read_selected_model_does_not_toggle_an_already_open_menu(tmp_path
     # Entering with the menu already open, a blind chip.click() would CLOSE it.
     # _open_chip_menu guards on aria-expanded, so we never click the chip.
     page = _FakePage(menu_open=True,
-                     model_radios=(("GPT-5.6 Sol", True), ("GPT-5.5", False)))
-    assert await read_selected_model(page, timeout=1.0) == "GPT-5.6 Sol"
+                     model_radios=(("Latest", True), ("GPT-5.6 Sol", False)))
+    assert await read_selected_model(page, timeout=1.0) == "Latest"
     assert "chip" not in page.clicks
