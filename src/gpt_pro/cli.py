@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +24,9 @@ CHROME_ACTIVITY_LOCK = STATE / "chrome-activity.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
+ACCOUNT_COUNT = 3
+ACCOUNT_ROUTER_LOCK = STATE / "account-router.lock"
+ACCOUNT_ROUTER_STATE = STATE / "account-router.json"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 # "Too many requests" conversation-history rate-limit modal (data-testid). A
 # parallel burst throttles the sidebar list endpoint (/backend-api/conversations
@@ -108,6 +112,77 @@ SIDE_BY_SIDE_CHROME_BUNDLE_IDS = {
     "com.google.Chrome.canary",
 }
 LAUNCH_DEBUG_PORT = 19222
+
+
+@dataclass(frozen=True)
+class AccountConfig:
+    account: int
+    profile: Path
+    port: int
+    launch_lock: Path
+    activity_lock: Path
+    slot_dir: Path
+
+
+def validate_account(account: int) -> int:
+    if account < 1 or account > ACCOUNT_COUNT:
+        raise ValueError(f"account must be between 1 and {ACCOUNT_COUNT}, got {account}")
+    return account
+
+
+def account_config(account: int) -> AccountConfig:
+    """Return the isolated browser/runtime resources for one ChatGPT account.
+
+    Account 1 deliberately retains the original paths and port so the existing
+    login and any older in-flight worker remain compatible. Additional accounts
+    use separate Chrome user-data directories, CDP ports, launch/activity locks,
+    and concurrency pools.
+    """
+    account = validate_account(int(account))
+    if account == 1:
+        profile = Path.home() / ".gpt-pro-profile"
+        runtime = STATE
+    else:
+        profile = Path.home() / f".gpt-pro-profile-{account}"
+        runtime = STATE / f"account-{account}"
+    return AccountConfig(
+        account=account,
+        profile=profile,
+        port=19221 + account,
+        launch_lock=runtime / "launch.lock",
+        activity_lock=runtime / "chrome-activity.lock",
+        slot_dir=runtime / "slots",
+    )
+
+
+def configure_account(account: int) -> AccountConfig:
+    """Bind this CLI process to one account's browser resources."""
+    global PROFILE, LAUNCH_LOCK, CHROME_ACTIVITY_LOCK, SLOT_LOCK_DIR, LAUNCH_DEBUG_PORT
+    config = account_config(account)
+    PROFILE = config.profile
+    LAUNCH_DEBUG_PORT = config.port
+    LAUNCH_LOCK = config.launch_lock
+    CHROME_ACTIVITY_LOCK = config.activity_lock
+    SLOT_LOCK_DIR = config.slot_dir
+    return config
+
+
+def allocate_account() -> int:
+    """Atomically select the next account in a persistent 1→2→3 rotation."""
+    with _FlockGuard(ACCOUNT_ROUTER_LOCK):
+        next_account = 1
+        try:
+            state = json.loads(ACCOUNT_ROUTER_STATE.read_text())
+            next_account = validate_account(int(state.get("next_account", 1)))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            next_account = 1
+        following = (next_account % ACCOUNT_COUNT) + 1
+        ACCOUNT_ROUTER_STATE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(
+            ACCOUNT_ROUTER_STATE,
+            json.dumps({"next_account": following, "updated_at": time.time()}),
+        )
+        return next_account
 
 
 MAX_PARALLEL_CEILING = 10  # Personal-use ceiling per CLAUDE.md / README.md.
@@ -239,9 +314,10 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
 
 def _find_chrome_browser_process() -> tuple[int, str] | None:
     """Return the PID and command of the gpt-pro Chrome browser process."""
+    pattern = f"user-data-dir={re.escape(str(PROFILE))}([[:space:]]|$)"
     try:
         out = subprocess.run(
-            ["pgrep", "-fl", f"user-data-dir={PROFILE}"],
+            ["pgrep", "-fl", pattern],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except Exception:
@@ -451,7 +527,7 @@ def _cdp_timeout_message(port: int) -> str:
     )
 
 
-def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: int | None = None) -> bool:
+def ensure_shared_chrome_running(port: int | None = None, skip_slot_id: int | None = None) -> bool:
     """Idempotent: launch Chrome bound to PROFILE if its CDP isn't responding.
 
     Returns True iff this call performed the launch (the "owner" return), False if
@@ -480,6 +556,8 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
     don't need to bind — Chrome's compositor stays bound for the rest of its
     lifetime once activated.
     """
+    if port is None:
+        port = LAUNCH_DEBUG_PORT
     app = validate_chrome_app(chrome_app_path())
     if probe_cdp(port):
         _require_running_chrome_app(app, port)
@@ -538,7 +616,7 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
             lease.downgrade_shared()
 
 
-async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
+async def connect_shared_chrome(pw, port: int | None = None):
     """Connect Playwright to the running Chrome via CDP. Returns the persistent context.
 
     Caller is responsible for `ctx.new_page()` per worker tab and `page.close()`
@@ -550,6 +628,8 @@ async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
     persistent default context can lag the CDP `/json/version` ready signal by
     a few hundred ms under contention.
     """
+    if port is None:
+        port = LAUNCH_DEBUG_PORT
     deadline = time.time() + 5.0
     while True:
         browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -568,9 +648,10 @@ def _kill_chrome_orphans() -> None:
     SIGKILL'd or crashed previous worker. Without this, the next Chrome launch
     fails with SingletonLock.
     """
+    pattern = f"user-data-dir={re.escape(str(PROFILE))}([[:space:]]|$)"
     try:
         out = subprocess.run(
-            ["pgrep", "-f", f"user-data-dir={PROFILE}"],
+            ["pgrep", "-f", pattern],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except Exception:
@@ -586,7 +667,7 @@ def _kill_chrome_orphans() -> None:
     time.sleep(0.5)
     try:
         stubborn = [p for p in subprocess.run(
-            ["pgrep", "-f", f"user-data-dir={PROFILE}"],
+            ["pgrep", "-f", pattern],
             capture_output=True, text=True, timeout=5,
         ).stdout.split() if p.strip()]
     except Exception:
@@ -1253,13 +1334,14 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 
 # ---- doctor ----
 
-async def cmd_doctor() -> int:
+async def cmd_doctor(account: int = 1) -> int:
+    configure_account(account)
     with ChromeActivityLease():
-        return await _cmd_doctor_with_browser()
+        return await _cmd_doctor_with_browser(account)
 
 
-async def _cmd_doctor_with_browser() -> int:
-    run_dir = new_run_dir("doctor")
+async def _cmd_doctor_with_browser(account: int = 1) -> int:
+    run_dir = new_run_dir(f"doctor-account-{account}")
     ensure_shared_chrome_running()
     async with async_playwright() as pw:
         ctx = await connect_shared_chrome(pw)
@@ -1295,6 +1377,7 @@ async def _cmd_doctor_with_browser() -> int:
             checks_ok = doctor_exit_ok(ok, chip_status, model_status)
             result = {
                 "status": "ok" if checks_ok else ("needs_reauth" if not ok else "misconfigured"),
+                "account": account,
                 "url": page.url,
                 "chip": chip_status,
                 "chip_text": chip_text,
@@ -1313,12 +1396,13 @@ async def _cmd_doctor_with_browser() -> int:
 
 # ---- login ----
 
-async def cmd_login() -> int:
+async def cmd_login(account: int = 1) -> int:
+    configure_account(account)
     with ChromeActivityLease():
-        return await _cmd_login_with_browser()
+        return await _cmd_login_with_browser(account)
 
 
-async def _cmd_login_with_browser() -> int:
+async def _cmd_login_with_browser(account: int = 1) -> int:
     ensure_shared_chrome_running()
     async with async_playwright() as pw:
         ctx = await connect_shared_chrome(pw)
@@ -1331,7 +1415,7 @@ async def _cmd_login_with_browser() -> int:
             await bring_tab_to_front(page)
             await page.goto("https://chatgpt.com/")
             await pin_viewport_cdp(ctx, page)
-            print(f"Chrome bound to {PROFILE}", file=sys.stderr)
+            print(f"Account {account} Chrome bound to {PROFILE}", file=sys.stderr)
             print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
             ok = await wait_for_login(ctx)
             print("Login detected." if ok else "Timed out without detecting login.", file=sys.stderr)
@@ -1428,6 +1512,7 @@ async def cmd_ask(args) -> int:
     # racing `ask` reads the attach path instead of re-deciding.
     with RunClaim(run_id):
         spawn_worker = True
+        account = None
         if run_dir.exists():
             meta_path = run_dir / "meta.json"
             if meta_path.exists():
@@ -1437,11 +1522,13 @@ async def cmd_ask(args) -> int:
                     meta = {}
                 existing_sha = meta.get("prompt_sha256")
                 if existing_sha == prompt_sha:
+                    account = int(meta.get("account", 1))
                     stderr_jsonl({
                         "status": "submitted",
                         "run_id": run_id,
                         "run_dir": str(run_dir),
                         "prompt_sha256": prompt_sha,
+                        "account": account,
                         "attached": True,
                     })
                     spawn_worker = False
@@ -1468,12 +1555,15 @@ async def cmd_ask(args) -> int:
                     return 2
 
         if spawn_worker:
+            requested_account = getattr(args, "account", "auto")
+            account = allocate_account() if requested_account == "auto" else validate_account(int(requested_account))
             run_dir.mkdir(parents=True, exist_ok=True)
             atomic_write(run_dir / "prompt.md", prompt_text)
             meta = {
                 "run_id": run_id,
                 "created_at": time.time(),
                 "prompt_sha256": prompt_sha,
+                "account": account,
             }
             atomic_write(run_dir / "meta.json", json.dumps(meta))
 
@@ -1484,6 +1574,7 @@ async def cmd_ask(args) -> int:
             "run_id": run_id,
             "run_dir": str(run_dir),
             "prompt_sha256": prompt_sha,
+            "account": account,
         })
 
     if args.no_wait:
@@ -3129,8 +3220,26 @@ async def _run_claimed(run_id: str, run_dir: Path) -> int:
             atomic_write(run_dir / "result.json", json.dumps(result))
         return 1
 
+    try:
+        meta_path = run_dir / "meta.json"
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        account = validate_account(int(meta.get("account", 1)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        result = {
+            "status": "error",
+            "reason": "invalid_account",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "detail": f"{type(e).__name__}: {e}",
+            "exit_code": 1,
+        }
+        atomic_write(result_path, json.dumps(result))
+        return 1
+
+    configure_account(account)
     prompt_text = prompt_path.read_text()
     result = await _browser_run(run_id, run_dir, prompt_text)
+    result.setdefault("account", account)
     atomic_write(run_dir / "result.json", json.dumps(result))
     return result.get("exit_code", 1)
 
@@ -3177,15 +3286,21 @@ def cmd_close_chrome(force: bool = False) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("login", help="Open Chrome on chatgpt.com to sign in. Cookies persist for `ask`.")
-    sub.add_parser("doctor", help="Verify the profile is logged in. Prints JSON; saves screenshot + HTML.")
+    login_p = sub.add_parser("login", help="Open one account's Chrome profile to sign in. Cookies persist for `ask`.")
+    login_p.add_argument("--account", type=int, choices=range(1, ACCOUNT_COUNT + 1), default=1)
+    doctor_p = sub.add_parser("doctor", help="Verify one account profile. Prints JSON; saves screenshot + HTML.")
+    doctor_p.add_argument("--account", type=int, choices=range(1, ACCOUNT_COUNT + 1), default=1)
     close_p = sub.add_parser("close-chrome", help="Tear down shared gpt-pro Chrome. Refuses while the browser is in use.")
     close_p.add_argument("--force", action="store_true",
                          help="Kill Chrome even while in use. Active workers/login/doctor lose their CDP connection.")
+    close_p.add_argument("--account", choices=[*(str(i) for i in range(1, ACCOUNT_COUNT + 1)), "all"], default="1",
+                         help="Account browser to close (default 1); use 'all' for every account.")
 
     ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT GPT-6 Pro. Prints response on stdout when ready.")
     ask_p.add_argument("--run-id", default=None,
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
+    ask_p.add_argument("--account", choices=["auto", *(str(i) for i in range(1, ACCOUNT_COUNT + 1))], default="auto",
+                      help="Account routing: persistent round-robin by default, or pin this run to one account.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,
                       help="Max seconds the parent will wait for completion. Default: wait indefinitely. This does not stop the detached worker.")
     ask_p.add_argument("--output", type=Path, default=None,
@@ -3211,9 +3326,9 @@ def main() -> int:
 
     args = p.parse_args()
     if args.cmd == "login":
-        return asyncio.run(cmd_login())
+        return asyncio.run(cmd_login(args.account))
     if args.cmd == "doctor":
-        return asyncio.run(cmd_doctor())
+        return asyncio.run(cmd_doctor(args.account))
     if args.cmd == "ask":
         return asyncio.run(cmd_ask(args))
     if args.cmd == "fetch":
@@ -3223,7 +3338,12 @@ def main() -> int:
     if args.cmd == "_run":
         return asyncio.run(cmd_run(args))
     if args.cmd == "close-chrome":
-        return cmd_close_chrome(force=args.force)
+        accounts = range(1, ACCOUNT_COUNT + 1) if args.account == "all" else [int(args.account)]
+        exit_code = 0
+        for account in accounts:
+            configure_account(account)
+            exit_code = max(exit_code, cmd_close_chrome(force=args.force))
+        return exit_code
     return 1
 
 

@@ -37,6 +37,8 @@ def harness(monkeypatch, tmp_path):
     runs.mkdir()
     monkeypatch.setattr(cli, "RUNS", runs)
     monkeypatch.setattr(cli, "CLAIMS", tmp_path / "claims")
+    monkeypatch.setattr(cli, "ACCOUNT_ROUTER_LOCK", tmp_path / "account-router.lock")
+    monkeypatch.setattr(cli, "ACCOUNT_ROUTER_STATE", tmp_path / "account-router.json")
     emitted = []
     monkeypatch.setattr(cli, "stderr_jsonl", lambda d: emitted.append(d))
     spawned = []

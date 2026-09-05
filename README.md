@@ -19,7 +19,8 @@ remote ──ssh──▶ Mac ──[parent: ask]
                        │ writes prompt.md, meta.json
                        │ spawns detached worker (start_new_session)
                        ▼
-                      [worker: _run] ──Playwright──▶ Chrome (persistent profile)
+                      [worker: _run] ──round robin──▶ account 1 / 2 / 3
+                                               └──▶ isolated Chrome profile
                        │                                          │
                        │ <── poll result.json ──┐                 ▼
                        │                        │      chatgpt.com / GPT-6 / Pro
@@ -36,18 +37,22 @@ Requires:
 
 - A Mac that stays logged into its GUI session. Playwright drives real Chrome and needs WindowServer access, so a headless box won't work — leave the Mac signed in (and use `caffeinate` if it sleeps).
 - Python 3.11+, [uv](https://docs.astral.sh/uv/), and the side-by-side Google Chrome Beta app. The relay needs real Chrome (not bundled Chromium), while Beta's distinct macOS bundle identity keeps it from intercepting Stable Chrome's Dock and update lifecycle.
-- A ChatGPT Pro account.
+- Three ChatGPT Pro accounts.
 
 ```bash
 brew install --cask google-chrome@beta
 open -a "Google Chrome Beta"   # once, on the Mac's own screen; approve the first-open prompt, then quit
 uv sync
-uv run gpt-pro-relay login     # opens Chrome Beta; sign in to ChatGPT manually
+uv run gpt-pro-relay login --account 1
+uv run gpt-pro-relay login --account 2
+uv run gpt-pro-relay login --account 3
 ```
 
 **Launch Chrome Beta once interactively before the relay ever touches it.** macOS asks for approval the first time you open freshly downloaded software, and that prompt appears on the Mac's own screen — an SSH-detached worker cannot answer it. Get it out of the way while a human is present. See [Troubleshooting](#a-newly-installed-chrome-never-binds-the-cdp-port) if the relay hangs on a new Chrome anyway.
 
-Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **Latest (GPT-6)** + **Pro** once so the account preference is set.
+Each account uses a dedicated Chrome user-data directory and CDP port. Account 1 keeps the original `~/.gpt-pro-profile/` and port `19222`; accounts 2 and 3 use `~/.gpt-pro-profile-2/` / `~/.gpt-pro-profile-3/` and ports `19223` / `19224`. Cookies persist independently. In each profile, manually select **Latest (GPT-6)** + **Pro** once so the account preference is set.
+
+Normal `ask` calls are assigned `1 → 2 → 3 → 1` using a persistent, lock-protected counter in `~/.gpt-pro/account-router.json`. Only a new accepted run advances the counter: reattaching to an existing run, rejecting an invalid prompt, or using explicit `--account N` does not. The selected account is saved in `meta.json` and returned in submit/result diagnostics.
 
 The default app is `/Applications/Google Chrome Beta.app`. `GPT_PRO_CHROME_APP` may select a Chrome Dev or Canary app with a recognized side-by-side bundle identity, but the relay rejects Stable Chrome's `com.google.Chrome` bundle identity instead of silently recreating the Dock conflict. Existing installations that previously used Stable should migrate while no workers are running:
 
@@ -79,11 +84,11 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 
 | Command | What it does |
 |---|---|
-| `gpt-pro-relay login` | Open the isolated Chrome Beta app at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
-| `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **Latest (GPT-6)** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
-| `gpt-pro-relay ask [--run-id ID] [--no-wait] [--generation-timeout SECONDS] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits indefinitely for completion and prints the response on stdout. `--generation-timeout` optionally bounds only this parent wait; it never stops the detached worker. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
+| `gpt-pro-relay login [--account 1\|2\|3]` | Open one isolated Chrome Beta profile at chatgpt.com. Auto-detects login and exits. Defaults to account 1. |
+| `gpt-pro-relay doctor [--account 1\|2\|3]` | Verify one account is logged in and configured for **Latest (GPT-6)** + **Pro**. Defaults to account 1. |
+| `gpt-pro-relay ask [--account auto\|1\|2\|3] [--run-id ID] [--no-wait] [--generation-timeout SECONDS] [--output PATH]` | Read a prompt, choose the next account by persistent round robin (`auto`, the default), and spawn a detached worker. An explicit account bypasses but does not advance the rotation. Same run ID + prompt reattaches to its original account. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
-| `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses while a worker, `login`, or `doctor` holds a browser activity lease; pass `--force` to kill anyway (active users lose their CDP connection). |
+| `gpt-pro-relay close-chrome [--account 1\|2\|3\|all] [--force]` | Tear down one account browser (account 1 by default) or all three. Each refuses while that account is in use unless `--force` is passed. |
 
 ## Usage
 
@@ -98,7 +103,7 @@ RUN_ID=$(uuidgen)
 echo "your prompt" | gpt-pro-relay ask --run-id "$RUN_ID"
 ```
 
-If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. Up to `GPT_PRO_MAX_PARALLEL` (default 6) concurrent runs share one Chrome process; beyond that they queue on a file-lock semaphore in `~/.gpt-pro/slots/`.
+If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. `GPT_PRO_MAX_PARALLEL` (default 6) applies per account; each account has its own Chrome process and slot pool.
 
 ### Remote (SSH)
 
@@ -158,7 +163,7 @@ Exit codes:
 Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 - `prompt.md` — input
-- `meta.json` — `{run_id, created_at, prompt_sha256}`
+- `meta.json` — `{run_id, created_at, prompt_sha256, account}`
 - `response.md` — the answer: a completed turn the model audit did not reject. `result.json` reports `extraction: "copy_button"` or `"innertext"`, and `model_audit` — which is `verified` when the served model was confirmed, or a fail-open value (`unverified_missing_slug`, `model_ok_slug_missing`) when a selector break left the model unconfirmed and the run was allowed through anyway. Check it if provenance matters to you.
 - `result.json` — terminal status (atomic). **It is the authority: only `status: "ok"` makes `response.md` usable.**
 - `response.rejected.md` / `response.incomplete.md` / `response.partial.md` / `response.pending.md` — the extracted text under the name its outcome earned: the served model failed the audit, an attachment-only prompt was acknowledged instead of executed, the turn never passed the completion gate, or the run died before either was decided. Diagnostics, never answers. Don't judge by reading them — a rejected or incomplete turn can be fluent and plausible, and a turn that missed the completion gate can be fully rendered.
@@ -172,9 +177,9 @@ A run leaves **at most one** of those five names (a failure before extraction pu
 
 ## Concurrency
 
-Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome Beta process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). The isolated browser stays alive between runs. Workers, `login`, and `doctor` hold shared browser activity leases; normal `close-chrome` must acquire the exclusive lease, so it cannot race a new browser user or terminate an active one.
+New runs are distributed evenly by count across the three accounts. Within each account, up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share that account's Chrome process; additional runs for that account wait in its own slot pool. Lower it to `1` if account-side anti-abuse appears. The macOS clipboard lock remains global because all three browsers share one physical pasteboard.
 
-Because Chrome Beta stays alive indefinitely, restart it periodically after its updater downloads a security update: wait for active browser users to finish, run `gpt-pro-relay close-chrome`, then run `gpt-pro-relay doctor` to relaunch and verify it.
+Because Chrome Beta stays alive indefinitely, restart it periodically after its updater downloads a security update: wait for active browser users to finish, run `gpt-pro-relay close-chrome --account all`, then run `doctor` once for each account to relaunch and verify them.
 
 ## Closing the Chrome tab mid-run
 

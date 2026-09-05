@@ -33,6 +33,8 @@ def _isolate_state(monkeypatch, tmp_path):
     claims = tmp_path / "claims"
     monkeypatch.setattr(cli, "RUNS", runs)
     monkeypatch.setattr(cli, "CLAIMS", claims)
+    monkeypatch.setattr(cli, "ACCOUNT_ROUTER_LOCK", tmp_path / "account-router.lock")
+    monkeypatch.setattr(cli, "ACCOUNT_ROUTER_STATE", tmp_path / "account-router.json")
     return types.SimpleNamespace(runs=runs, claims=claims)
 
 
