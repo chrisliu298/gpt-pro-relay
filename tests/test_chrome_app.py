@@ -7,6 +7,7 @@ the user's normal Chrome icon target the automation process.
 """
 
 import plistlib
+import subprocess
 
 import pytest
 
@@ -38,6 +39,45 @@ def test_chrome_app_path_accepts_explicit_override(tmp_path, monkeypatch):
     app = tmp_path / "Custom Chrome.app"
     monkeypatch.setenv("GPT_PRO_CHROME_APP", str(app))
     assert cli.chrome_app_path() == app
+
+
+def test_profile_process_pattern_uses_posix_ere_escaping(monkeypatch):
+    monkeypatch.setattr(cli, "PROFILE", cli.Path("/Users/test/.gpt-pro-profile-3"))
+
+    pattern = cli._profile_process_pattern()
+
+    assert pattern == (
+        "user-data-dir=/Users/test/\\.gpt-pro-profile-3([[:space:]]|$)"
+    )
+
+
+def test_find_browser_process_accepts_hyphenated_profile(monkeypatch):
+    executable = "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"
+
+    def run(argv, **_kwargs):
+        assert argv == [
+            "pgrep",
+            "-fl",
+            "user-data-dir=/Users/test/\\.gpt-pro-profile-3([[:space:]]|$)",
+        ]
+        assert _kwargs["env"]["LC_ALL"] == "C"
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                f"123 {executable} --remote-debugging-port=19224 "
+                "--user-data-dir=/Users/test/.gpt-pro-profile-3\n"
+            ),
+        )
+
+    monkeypatch.setattr(cli, "PROFILE", cli.Path("/Users/test/.gpt-pro-profile-3"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli._find_chrome_browser_process() == (
+        123,
+        f"{executable} --remote-debugging-port=19224 "
+        "--user-data-dir=/Users/test/.gpt-pro-profile-3",
+    )
 
 
 def test_validate_chrome_app_accepts_side_by_side_beta(tmp_path):

@@ -24,7 +24,7 @@ CHROME_ACTIVITY_LOCK = STATE / "chrome-activity.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
-ACCOUNT_COUNT = 3
+ACCOUNT_COUNT = 4
 ACCOUNT_ROUTER_LOCK = STATE / "account-router.lock"
 ACCOUNT_ROUTER_STATE = STATE / "account-router.json"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
@@ -168,7 +168,7 @@ def configure_account(account: int) -> AccountConfig:
 
 
 def allocate_account() -> int:
-    """Atomically select the next account in a persistent 1→2→3 rotation."""
+    """Atomically select the next account in a persistent 1→2→3→4 rotation."""
     with _FlockGuard(ACCOUNT_ROUTER_LOCK):
         next_account = 1
         try:
@@ -312,13 +312,33 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
         log_stage("pin_viewport_skipped", exception=f"{type(e).__name__}: {e}")
 
 
+def _posix_ere_escape(value: str) -> str:
+    """Escape a literal for BSD ``pgrep``'s POSIX extended regex syntax.
+
+    ``re.escape`` targets Python's regex engine and needlessly escapes ``-``;
+    keep the expression limited to POSIX ERE metacharacters.
+    """
+    metacharacters = frozenset(r"\.^$[]()|*+?{}")
+    return "".join(f"\\{char}" if char in metacharacters else char for char in value)
+
+
+def _profile_process_pattern() -> str:
+    """Return a BSD-pgrep-compatible exact argument match for this profile."""
+    return f"user-data-dir={_posix_ere_escape(str(PROFILE))}([[:space:]]|$)"
+
+
 def _find_chrome_browser_process() -> tuple[int, str] | None:
     """Return the PID and command of the gpt-pro Chrome browser process."""
-    pattern = f"user-data-dir={re.escape(str(PROFILE))}([[:space:]]|$)"
+    pattern = _profile_process_pattern()
     try:
         out = subprocess.run(
             ["pgrep", "-fl", pattern],
             capture_output=True, text=True, timeout=5,
+            # BSD pgrep decodes every candidate command line using the current
+            # locale before matching. One unrelated process with non-decodable
+            # argv makes the whole query fail with REG_ILLSEQ ("illegal byte
+            # sequence"). Bytewise matching is sufficient for our ASCII flag.
+            env={**os.environ, "LC_ALL": "C"},
         ).stdout
     except Exception:
         return None
@@ -648,11 +668,12 @@ def _kill_chrome_orphans() -> None:
     SIGKILL'd or crashed previous worker. Without this, the next Chrome launch
     fails with SingletonLock.
     """
-    pattern = f"user-data-dir={re.escape(str(PROFILE))}([[:space:]]|$)"
+    pattern = _profile_process_pattern()
     try:
         out = subprocess.run(
             ["pgrep", "-f", pattern],
             capture_output=True, text=True, timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
         ).stdout
     except Exception:
         return
@@ -669,6 +690,7 @@ def _kill_chrome_orphans() -> None:
         stubborn = [p for p in subprocess.run(
             ["pgrep", "-f", pattern],
             capture_output=True, text=True, timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
         ).stdout.split() if p.strip()]
     except Exception:
         stubborn = []
@@ -781,6 +803,7 @@ def _worker_process_alive(run_id: str) -> bool:
         r = subprocess.run(
             ["pgrep", "-f", pattern],
             capture_output=True, timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
         return True
@@ -948,12 +971,51 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
+AUTHENTICATED_SHELL_SELECTOR = (
+    '[data-testid="accounts-profile-button"], '
+    'button[aria-label="Open profile menu"]'
+)
+
+
+async def is_login_complete(ctx, page) -> bool:
+    """Require both the session cookie and ChatGPT's authenticated app shell.
+
+    The email/auth flow can create a session-token cookie before authentication
+    is finalized. Treating that cookie alone as success closes the interactive
+    login window mid-flow and can leave the persisted profile logged out. The
+    profile button changed from a data-testid to an accessible label in the
+    2026-09 UI, so accept either authenticated-shell marker.
+    """
+    if not await is_logged_in(ctx):
+        return False
+    try:
+        return await page.locator(AUTHENTICATED_SHELL_SELECTOR).count() > 0
+    except Exception:
+        return False
+
+
 # Since the 2026-09 GPT-6 rollout the composer chip renders the model generation
 # and effort together ("6\nPro"). The selected model radio is the rolling label
 # "Latest"; older pinned models remain separate radios. The pre-send chip still
 # gates on the top "Pro" effort, while the post-send slug is the authoritative
-# model identity. See `is_pro_label` and `classify_served_audit`.
-COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
+# model identity. The home-composer redesign replaced the old classed pill with
+# an accessible model button but preserved the menu structure.
+COMPOSER_CHIP = (
+    'button.__composer-pill[aria-haspopup="menu"], '
+    'button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]'
+)
+SEND_BUTTON = (
+    '[data-testid="send-button"], '
+    'button[aria-label="Send prompt"], '
+    'button[aria-label="Send message"], '
+    'button[aria-label="Send"]'
+)
+SEND_BUTTON_READY = (
+    '[data-testid="send-button"]:not([disabled]):not([aria-disabled="true"]), '
+    'button[aria-label="Send prompt"]:not([disabled]):not([aria-disabled="true"]), '
+    'button[aria-label="Send message"]:not([disabled]):not([aria-disabled="true"]), '
+    'button[aria-label="Send"]:not([disabled]):not([aria-disabled="true"])'
+)
 PRO_TOKEN = "Pro"
 # Ground-truth model slug stamped on the served assistant turn
 # (data-message-model-slug). This is the only *authoritative* model signal, but
@@ -1319,12 +1381,12 @@ async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
             pass
 
 
-async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
+async def wait_for_login(ctx, page, *, timeout: float = 600.0) -> bool:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         try:
-            if await is_logged_in(ctx):
+            if await is_login_complete(ctx, page):
                 return True
         except Exception:
             return False
@@ -1336,8 +1398,11 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 
 async def cmd_doctor(account: int = 1) -> int:
     configure_account(account)
-    with ChromeActivityLease():
-        return await _cmd_doctor_with_browser(account)
+    with ChromeActivityLease() as lease:
+        try:
+            return await _cmd_doctor_with_browser(account)
+        finally:
+            close_chrome_if_idle(lease)
 
 
 async def _cmd_doctor_with_browser(account: int = 1) -> int:
@@ -1352,7 +1417,7 @@ async def _cmd_doctor_with_browser(account: int = 1) -> int:
             bind_chrome_compositor_surface()
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             await pin_viewport_cdp(ctx, page)
-            ok = await wait_for_login(ctx, timeout=30.0)
+            ok = await wait_for_login(ctx, page, timeout=30.0)
             await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
             (run_dir / "page.html").write_text(await page.content())
             chip_status = "skipped"
@@ -1398,8 +1463,11 @@ async def _cmd_doctor_with_browser(account: int = 1) -> int:
 
 async def cmd_login(account: int = 1) -> int:
     configure_account(account)
-    with ChromeActivityLease():
-        return await _cmd_login_with_browser(account)
+    with ChromeActivityLease() as lease:
+        try:
+            return await _cmd_login_with_browser(account)
+        finally:
+            close_chrome_if_idle(lease)
 
 
 async def _cmd_login_with_browser(account: int = 1) -> int:
@@ -1417,7 +1485,7 @@ async def _cmd_login_with_browser(account: int = 1) -> int:
             await pin_viewport_cdp(ctx, page)
             print(f"Account {account} Chrome bound to {PROFILE}", file=sys.stderr)
             print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
-            ok = await wait_for_login(ctx)
+            ok = await wait_for_login(ctx, page)
             print("Login detected." if ok else "Timed out without detecting login.", file=sys.stderr)
         finally:
             try:
@@ -1751,7 +1819,7 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
             # OS clipboard. Same selector used by the actual send-click below.
             try:
                 await page.wait_for_selector(
-                    '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
+                    SEND_BUTTON,
                     timeout=10000, state="visible",
                 )
             except Exception as e:
@@ -1845,7 +1913,16 @@ async def served_assistant_model_slug(page) -> str | None:
                 '[data-message-author-role="assistant"][data-message-model-slug]'
             ));
             const last = msgs[msgs.length - 1];
-            return last ? last.getAttribute('data-message-model-slug') : null;
+            if (last) return last.getAttribute('data-message-model-slug');
+            const turns = Array.from(document.querySelectorAll('[data-turn-key]'))
+                .filter(t => t.querySelector('[data-chatgpt-agent-turn-start]'));
+            const turn = turns[turns.length - 1];
+            if (!turn) return null;
+            const slugged = Array.from(
+                turn.querySelectorAll('[data-message-model-slug]')
+            );
+            const latest = slugged[slugged.length - 1];
+            return latest ? latest.getAttribute('data-message-model-slug') : null;
         }""")
     except Exception:
         # A CLOSED page here would otherwise degrade to a fail-open "unverified"
@@ -1870,10 +1947,29 @@ async def _copy_button_present(page) -> bool:
         return await page.evaluate("""() => {
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             const last = msgs[msgs.length - 1];
-            if (!last) return false;
-            const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
-            if (!container) return false;
-            return !!container.querySelector('[data-testid="copy-turn-action-button"]');
+            if (last) {
+                const container = last.closest('[data-testid^="conversation-turn"]')
+                    || last.parentElement;
+                if (container?.querySelector('[data-testid="copy-turn-action-button"]')) {
+                    return true;
+                }
+            }
+            const turns = Array.from(document.querySelectorAll('[data-turn-key]'))
+                .filter(t => t.querySelector('[data-chatgpt-agent-turn-start]'));
+            const turn = turns[turns.length - 1];
+            if (!turn) return false;
+            return Array.from(turn.querySelectorAll('button[aria-label="Copy"]'))
+                .some(btn => {
+                    let bar = btn.parentElement;
+                    for (let depth = 0; bar && bar !== turn && depth < 6;
+                         depth++, bar = bar.parentElement) {
+                        if (bar.querySelector('button[aria-label="Rate response"]')
+                                && bar.querySelector(
+                                    'button[aria-label="Regenerate response"]'
+                                )) return true;
+                    }
+                    return false;
+                });
         }""")
     except Exception:
         # A close must not read as "not yet complete" — that would spin the
@@ -1909,10 +2005,35 @@ async def _copy_button_extract(page) -> str | None:
             clicked = await page.evaluate("""() => {
                 const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
                 const last = msgs[msgs.length - 1];
-                if (!last) return false;
-                const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
-                if (!container) return false;
-                const btn = container.querySelector('[data-testid="copy-turn-action-button"]');
+                let btn = null;
+                if (last) {
+                    const container = last.closest('[data-testid^="conversation-turn"]')
+                        || last.parentElement;
+                    btn = container?.querySelector(
+                        '[data-testid="copy-turn-action-button"]'
+                    ) || null;
+                }
+                if (!btn) {
+                    const turns = Array.from(document.querySelectorAll('[data-turn-key]'))
+                        .filter(t => t.querySelector('[data-chatgpt-agent-turn-start]'));
+                    const turn = turns[turns.length - 1];
+                    if (turn) {
+                        btn = Array.from(
+                            turn.querySelectorAll('button[aria-label="Copy"]')
+                        ).find(candidate => {
+                            let bar = candidate.parentElement;
+                            for (let depth = 0; bar && bar !== turn && depth < 6;
+                                 depth++, bar = bar.parentElement) {
+                                if (bar.querySelector(
+                                        'button[aria-label="Rate response"]'
+                                    ) && bar.querySelector(
+                                        'button[aria-label="Regenerate response"]'
+                                    )) return true;
+                            }
+                            return false;
+                        }) || null;
+                    }
+                }
                 if (!btn) return false;
                 btn.click();
                 return true;
@@ -2203,6 +2324,39 @@ class ParallelSlot:
             self.slot_id = None
 
 
+def close_chrome_if_idle(lease: ChromeActivityLease) -> bool:
+    """Best-effort shutdown of this account's Chrome after its last worker.
+
+    The worker still holds its shared activity lease but has already released
+    its ParallelSlot. Converting that exact lease to exclusive proves there is
+    no sibling worker, login, or doctor using this account. Holding it exclusive
+    through the kill also prevents a newly arriving worker from entering the
+    check-to-kill gap; that worker waits, then relaunches Chrome normally.
+
+    Older relay workers may hold only a slot, so retain the slot check as a
+    compatibility guard. Shutdown is deliberately best-effort: a teardown
+    failure must never replace or hide the completed run's result.
+    """
+    if not lease.try_upgrade_exclusive():
+        log_stage("chrome_idle_close_skipped", reason="browser_in_use")
+        return False
+    try:
+        with LaunchLock():
+            if _slots_held():
+                log_stage("chrome_idle_close_skipped", reason="workers_in_flight")
+                return False
+            _kill_chrome_orphans()
+        log_stage("chrome_idle_closed", profile=str(PROFILE), port=LAUNCH_DEBUG_PORT)
+        return True
+    except Exception as e:
+        log_stage(
+            "chrome_idle_close_skipped",
+            reason="shutdown_failed",
+            exception=f"{type(e).__name__}: {e}",
+        )
+        return False
+
+
 async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
     network_log: list = []
 
@@ -2229,13 +2383,19 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         # Activity must precede slot admission. If close-chrome already owns the
         # exclusive lease, a new worker blocks here without taking a slot that
         # shutdown could mistake for an older lease-less active worker.
-        with ChromeActivityLease():
-            with ParallelSlot(get_max_parallel(), stop_check=lambda: stop_requested(run_dir)) as slot:
-                # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
-                # the worker counts its own held slot and never recovers (see _slots_held).
-                return await _run_with_browser(
-                    run_id, run_dir, prompt_text, network_log, err, slot.slot_id,
-                )
+        with ChromeActivityLease() as lease:
+            try:
+                with ParallelSlot(get_max_parallel(), stop_check=lambda: stop_requested(run_dir)) as slot:
+                    # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
+                    # the worker counts its own held slot and never recovers (see _slots_held).
+                    return await _run_with_browser(
+                        run_id, run_dir, prompt_text, network_log, err, slot.slot_id,
+                    )
+            finally:
+                # The slot is released before this point. Close only if this
+                # worker can atomically prove it is the account's last browser
+                # user; failures are logged but never mask the run result.
+                close_chrome_if_idle(lease)
     except RunStopped:
         log_stage("stopped", reason="stopped_before_send", phase="queued")
         return _stopped_result(run_id, run_dir, "stopped_before_send")
@@ -2449,7 +2609,16 @@ async def read_latest_assistant_text(page) -> str:
         return await page.evaluate(
             """() => {
                 const e = document.querySelectorAll('[data-message-author-role="assistant"]');
-                return e.length ? e[e.length - 1].innerText : '';
+                if (e.length) return e[e.length - 1].innerText;
+                const turns = Array.from(document.querySelectorAll('[data-turn-key]'))
+                    .filter(t => t.querySelector('[data-chatgpt-agent-turn-start]'));
+                const turn = turns[turns.length - 1];
+                const start = turn?.querySelector('[data-chatgpt-agent-turn-start]');
+                if (!turn || !start) return '';
+                const range = document.createRange();
+                range.setStartAfter(start);
+                range.setEndAfter(turn.lastChild);
+                return range.cloneContents().textContent || '';
             }"""
         )
     except Exception:
@@ -2496,7 +2665,9 @@ async def _user_turn_present(page) -> bool:
     a closed tab so the landing gate defers to recovery rather than false-report
     not-landed."""
     try:
-        return await page.locator('[data-message-author-role="user"]').count() > 0
+        return await page.locator(
+            '[data-message-author-role="user"], [data-user-message-bubble]'
+        ).count() > 0
     except Exception:
         if page.is_closed():
             raise RunPageClosed()
@@ -2602,7 +2773,7 @@ async def _recover_navigate(ctx, page, conv_url: str, *, deadline: float) -> str
         return "deadline"
     try:
         await page.wait_for_selector(
-            "[data-message-author-role]",
+            "[data-message-author-role], [data-turn-key]",
             timeout=int(min(30.0, remaining) * 1000),
             state="attached",
         )
@@ -2948,7 +3119,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
 
                 await _goto_with_retry(page, "https://chatgpt.com/")
                 await pin_viewport_cdp(ctx, page)
-                if not await wait_for_login(ctx, timeout=30.0):
+                if not await wait_for_login(ctx, page, timeout=30.0):
                     await safe_screenshot(page, run_dir / "error-needs_reauth.png")
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="needs_reauth")
@@ -2977,14 +3148,9 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 # ceiling so a stuck upload fails closed at a bounded deadline
                 # instead of masquerading as a 30s click timeout. Outside
                 # UiClipboardLock — sibling workers must stay free to paste.
-                send_ready_selector = (
-                    '[data-testid="send-button"]:not([disabled]):not([aria-disabled="true"]), '
-                    'button[aria-label="Send prompt"]:not([disabled]):not([aria-disabled="true"]), '
-                    'button[aria-label="Send message"]:not([disabled]):not([aria-disabled="true"])'
-                )
                 upload_wait_start = time.time()
                 try:
-                    await page.wait_for_selector(send_ready_selector, timeout=300_000, state="visible")
+                    await page.wait_for_selector(SEND_BUTTON_READY, timeout=300_000, state="visible")
                 finally:
                     upload_wait_elapsed = time.time() - upload_wait_start
                     if upload_wait_elapsed >= 2.0:
@@ -3050,9 +3216,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                                {"verified": chip_text, "presend": presend_chip})
                 log_stage("model_reverified", chip_text=presend_chip)
 
-                send_btn = page.locator(
-                    '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
-                ).first
+                send_btn = page.locator(SEND_BUTTON).first
 
                 # Register the conversation-URL observer BEFORE the click so a fast
                 # /  ->  /c/<id> pushState transition cannot be missed. The handler

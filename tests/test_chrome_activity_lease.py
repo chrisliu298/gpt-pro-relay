@@ -195,6 +195,73 @@ def test_upgraded_lease_blocks_a_new_browser_user_during_the_kill(tmp_path, monk
             child2.join(5)
 
 
+def test_idle_close_kills_when_worker_is_the_only_account_user(tmp_path, monkeypatch):
+    lock_path = tmp_path / "chrome-activity.lock"
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", lock_path)
+    monkeypatch.setattr(cli, "LaunchLock", _DummyLock)
+    monkeypatch.setattr(cli, "_slots_held", lambda: False)
+    killed = []
+    monkeypatch.setattr(cli, "_kill_chrome_orphans", lambda: killed.append(True))
+    stages = []
+    monkeypatch.setattr(cli, "log_stage", lambda stage, **kw: stages.append((stage, kw)))
+
+    with cli.ChromeActivityLease() as lease:
+        assert cli.close_chrome_if_idle(lease) is True
+        assert lease.exclusive is True
+
+    assert killed == [True]
+    assert stages[-1][0] == "chrome_idle_closed"
+
+
+def test_idle_close_skips_when_another_account_user_holds_the_lease(tmp_path, monkeypatch):
+    lock_path = tmp_path / "chrome-activity.lock"
+    ctx = multiprocessing.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_hold_shared_lease, args=(lock_path, ready, release))
+    child.start()
+    assert ready.wait(5), "child never acquired the shared Chrome lease"
+
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", lock_path)
+    killed = []
+    monkeypatch.setattr(cli, "_kill_chrome_orphans", lambda: killed.append(True))
+    stages = []
+    monkeypatch.setattr(cli, "log_stage", lambda stage, **kw: stages.append((stage, kw)))
+    try:
+        with cli.ChromeActivityLease() as lease:
+            assert cli.close_chrome_if_idle(lease) is False
+            assert lease.exclusive is False
+    finally:
+        release.set()
+        child.join(5)
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+
+    assert child.exitcode == 0
+    assert killed == []
+    assert stages[-1] == ("chrome_idle_close_skipped", {"reason": "browser_in_use"})
+
+
+def test_idle_close_failure_never_masks_the_completed_run(tmp_path, monkeypatch):
+    lock_path = tmp_path / "chrome-activity.lock"
+    monkeypatch.setattr(cli, "CHROME_ACTIVITY_LOCK", lock_path)
+    monkeypatch.setattr(cli, "LaunchLock", _DummyLock)
+    monkeypatch.setattr(cli, "_slots_held", lambda: False)
+
+    def fail_kill():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "_kill_chrome_orphans", fail_kill)
+    stages = []
+    monkeypatch.setattr(cli, "log_stage", lambda stage, **kw: stages.append((stage, kw)))
+
+    with cli.ChromeActivityLease() as lease:
+        assert cli.close_chrome_if_idle(lease) is False
+
+    assert stages[-1][0] == "chrome_idle_close_skipped"
+    assert stages[-1][1]["reason"] == "shutdown_failed"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", [cli.cmd_login, cli.cmd_doctor])
 async def test_login_and_doctor_acquire_activity_before_ensure(command, tmp_path, monkeypatch):
@@ -212,13 +279,20 @@ async def test_login_and_doctor_acquire_activity_before_ensure(command, tmp_path
         assert events == ["enter"]
         raise RuntimeError("stop after lease assertion")
 
+    def idle_close(lease):
+        assert isinstance(lease, _RecordingLease)
+        assert events == ["enter"]
+        events.append("idle_close")
+        return True
+
     monkeypatch.setattr(cli, "ChromeActivityLease", _RecordingLease)
     monkeypatch.setattr(cli, "ensure_shared_chrome_running", fail_ensure)
+    monkeypatch.setattr(cli, "close_chrome_if_idle", idle_close)
     monkeypatch.setattr(cli, "new_run_dir", lambda _prefix: tmp_path)
 
     with pytest.raises(RuntimeError, match="lease assertion"):
         await command()
-    assert events == ["enter", "exit"]
+    assert events == ["enter", "idle_close", "exit"]
 
 
 @pytest.mark.asyncio
@@ -251,11 +325,20 @@ async def test_worker_acquires_activity_before_parallel_slot(tmp_path, monkeypat
         assert events == ["activity_enter", "slot_enter"]
         return {"status": "ok"}
 
+    def idle_close(lease):
+        assert isinstance(lease, _RecordingLease)
+        assert events == ["activity_enter", "slot_enter", "slot_exit"]
+        events.append("idle_close")
+        return True
+
     monkeypatch.setattr(cli, "ChromeActivityLease", _RecordingLease)
     monkeypatch.setattr(cli, "ParallelSlot", _RecordingSlot)
     monkeypatch.setattr(cli, "_run_with_browser", browser_stub)
+    monkeypatch.setattr(cli, "close_chrome_if_idle", idle_close)
 
     result = await cli._browser_run("run", tmp_path, "prompt")
 
     assert result == {"status": "ok"}
-    assert events == ["activity_enter", "slot_enter", "slot_exit", "activity_exit"]
+    assert events == [
+        "activity_enter", "slot_enter", "slot_exit", "idle_close", "activity_exit",
+    ]

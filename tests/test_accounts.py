@@ -36,14 +36,16 @@ def test_account_config_preserves_account_one_profile_and_isolates_runtime_paths
     one = cli.account_config(1)
     two = cli.account_config(2)
     three = cli.account_config(3)
+    four = cli.account_config(4)
 
     assert one.profile == Path.home() / ".gpt-pro-profile"
     assert two.profile == Path.home() / ".gpt-pro-profile-2"
     assert three.profile == Path.home() / ".gpt-pro-profile-3"
-    assert {one.port, two.port, three.port} == {19222, 19223, 19224}
-    assert len({one.launch_lock, two.launch_lock, three.launch_lock}) == 3
-    assert len({one.activity_lock, two.activity_lock, three.activity_lock}) == 3
-    assert len({one.slot_dir, two.slot_dir, three.slot_dir}) == 3
+    assert four.profile == Path.home() / ".gpt-pro-profile-4"
+    assert {one.port, two.port, three.port, four.port} == {19222, 19223, 19224, 19225}
+    assert len({one.launch_lock, two.launch_lock, three.launch_lock, four.launch_lock}) == 4
+    assert len({one.activity_lock, two.activity_lock, three.activity_lock, four.activity_lock}) == 4
+    assert len({one.slot_dir, two.slot_dir, three.slot_dir, four.slot_dir}) == 4
 
 
 def test_configure_account_switches_the_process_browser_resources(monkeypatch):
@@ -54,9 +56,9 @@ def test_configure_account_switches_the_process_browser_resources(monkeypatch):
     for name, value in original.items():
         monkeypatch.setattr(cli, name, value)
 
-    config = cli.configure_account(3)
+    config = cli.configure_account(4)
     assert cli.PROFILE == config.profile
-    assert cli.LAUNCH_DEBUG_PORT == 19224
+    assert cli.LAUNCH_DEBUG_PORT == 19225
     assert cli.LAUNCH_LOCK == config.launch_lock
     assert cli.CHROME_ACTIVITY_LOCK == config.activity_lock
     assert cli.SLOT_LOCK_DIR == config.slot_dir
@@ -81,20 +83,20 @@ def test_round_robin_is_persistent_and_uniform(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "ACCOUNT_ROUTER_LOCK", tmp_path / "account-router.lock")
     monkeypatch.setattr(cli, "ACCOUNT_ROUTER_STATE", tmp_path / "account-router.json")
 
-    assert [cli.allocate_account() for _ in range(7)] == [1, 2, 3, 1, 2, 3, 1]
+    assert [cli.allocate_account() for _ in range(9)] == [1, 2, 3, 4, 1, 2, 3, 4, 1]
 
 
 @pytest.mark.asyncio
 async def test_new_runs_round_robin_and_record_account(isolated, monkeypatch):
-    for i in range(1, 7):
+    for i in range(1, 9):
         monkeypatch.setattr("sys.stdin", io.StringIO(f"prompt {i}"))
         assert await cli.cmd_ask(ask_args(f"run-{i}")) == 0
 
     accounts = [
         json.loads((isolated.runs / f"run-{i}" / "meta.json").read_text())["account"]
-        for i in range(1, 7)
+        for i in range(1, 9)
     ]
-    assert accounts == [1, 2, 3, 1, 2, 3]
+    assert accounts == [1, 2, 3, 4, 1, 2, 3, 4]
 
 
 @pytest.mark.asyncio
@@ -116,13 +118,13 @@ async def test_reattach_does_not_advance_round_robin(isolated, monkeypatch):
 @pytest.mark.asyncio
 async def test_explicit_account_bypasses_round_robin(isolated, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("manual"))
-    assert await cli.cmd_ask(ask_args("manual", account="3")) == 0
+    assert await cli.cmd_ask(ask_args("manual", account="4")) == 0
     monkeypatch.setattr("sys.stdin", io.StringIO("auto"))
     assert await cli.cmd_ask(ask_args("auto")) == 0
 
     manual = json.loads((isolated.runs / "manual" / "meta.json").read_text())
     auto = json.loads((isolated.runs / "auto" / "meta.json").read_text())
-    assert manual["account"] == 3
+    assert manual["account"] == 4
     assert auto["account"] == 1
 
 
