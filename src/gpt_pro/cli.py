@@ -1963,10 +1963,11 @@ async def _copy_button_present(page) -> bool:
                     let bar = btn.parentElement;
                     for (let depth = 0; bar && bar !== turn && depth < 6;
                          depth++, bar = bar.parentElement) {
-                        if (bar.querySelector('button[aria-label="Rate response"]')
-                                && bar.querySelector(
-                                    'button[aria-label="Regenerate response"]'
-                                )) return true;
+                        if (bar.classList.contains('turn-action-controls')
+                                || (bar.querySelector('button[aria-label="Rate response"]')
+                                    && bar.querySelector(
+                                        'button[aria-label="Regenerate response"]'
+                                    ))) return true;
                     }
                     return false;
                 });
@@ -2024,11 +2025,12 @@ async def _copy_button_extract(page) -> str | None:
                             let bar = candidate.parentElement;
                             for (let depth = 0; bar && bar !== turn && depth < 6;
                                  depth++, bar = bar.parentElement) {
-                                if (bar.querySelector(
-                                        'button[aria-label="Rate response"]'
-                                    ) && bar.querySelector(
-                                        'button[aria-label="Regenerate response"]'
-                                    )) return true;
+                                if (bar.classList.contains('turn-action-controls')
+                                        || (bar.querySelector(
+                                                'button[aria-label="Rate response"]'
+                                            ) && bar.querySelector(
+                                                'button[aria-label="Regenerate response"]'
+                                            ))) return true;
                             }
                             return false;
                         }) || null;

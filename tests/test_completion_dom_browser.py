@@ -96,3 +96,22 @@ async def test_new_turn_code_copy_alone_is_not_completion(page):
     )
 
     assert await cli._copy_button_present(page) is False
+
+
+async def test_current_turn_toolbar_completes_without_rate_response_button(page):
+    await page.set_content(
+        """
+        <div data-turn-key="turn-1">
+          <span data-chatgpt-agent-turn-start></span>
+          <div class="answer"><pre><button aria-label="Copy">code copy</button></pre></div>
+          <div class="turn-action-controls">
+            <button aria-label="Copy">response copy</button>
+            <button aria-label="Share"></button>
+            <button aria-label="Regenerate response"></button>
+            <button aria-label="React"></button>
+          </div>
+        </div>
+        """
+    )
+
+    assert await cli._copy_button_present(page) is True
