@@ -24,7 +24,7 @@ CHROME_ACTIVITY_LOCK = STATE / "chrome-activity.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
-ACCOUNT_COUNT = 4
+ACCOUNT_COUNT = 3
 ACCOUNT_ROUTER_LOCK = STATE / "account-router.lock"
 ACCOUNT_ROUTER_STATE = STATE / "account-router.json"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
@@ -168,7 +168,7 @@ def configure_account(account: int) -> AccountConfig:
 
 
 def allocate_account() -> int:
-    """Atomically select the next account in a persistent 1→2→3→4 rotation."""
+    """Atomically select the next account in a persistent 1→2→3 rotation."""
     with _FlockGuard(ACCOUNT_ROUTER_LOCK):
         next_account = 1
         try:
