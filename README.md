@@ -87,7 +87,8 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 | `gpt-pro-relay login [--account 1\|2\|3]` | Open one isolated Chrome Beta profile at chatgpt.com. Auto-detects login and exits. Defaults to account 1. |
 | `gpt-pro-relay doctor [--account 1\|2\|3]` | Verify one account is logged in and configured for **Latest (GPT-6)** + **Pro**. Defaults to account 1. |
 | `gpt-pro-relay ask [--account auto\|1\|2\|3] [--run-id ID] [--no-wait] [--generation-timeout SECONDS] [--output PATH]` | Read a prompt, choose the next account by persistent round robin (`auto`, the default), and spawn a detached worker. An explicit account bypasses but does not advance the rotation. Same run ID + prompt reattaches to its original account. |
-| `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
+| `gpt-pro-relay fetch <run-id> [--recover] [--output PATH]` | Read an existing result or wait for the worker. `--recover` restores a dead collector from its saved conversation URL, without sending a prompt. `--timeout 0` checks only; `--timeout 60` bounds waiting. |
+| `gpt-pro-relay stop <run-id> [--timeout SECONDS]` | Request a graceful stop: dequeue before sending, or click Stop on the original turn after sending. |
 | `gpt-pro-relay close-chrome [--account 1\|2\|3\|all] [--force]` | Tear down one account browser (account 1 by default) or all three. Each refuses while that account is in use unless `--force` is passed. |
 
 ## Usage
@@ -156,6 +157,8 @@ Exit codes:
 | 2 | usage error (empty prompt, prompt_too_large, run_id_conflict, invalid run_id) |
 | 3 | `status: timeout` from a legacy worker created before the generation cap was removed |
 | 4 | run_dir not found (fetch only) |
+| 5 | run stopped; no answer returned |
+| 6 | no live worker; diagnostic only, without changing the run's result |
 | 124 | wait timed out, run still pending |
 
 ## Artifacts
@@ -180,6 +183,22 @@ A run leaves **at most one** of those five names (a failure before extraction pu
 New runs are distributed evenly by count across the three accounts. Within each account, up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share that account's Chrome process; additional runs for that account wait in its own slot pool. Lower it to `1` if account-side anti-abuse appears.
 
 When a worker, `login`, or `doctor` finishes, it closes that account's Chrome if it is the last active user. Concurrent runs keep sharing the process until the last one exits; a newly arriving run is excluded from the shutdown window and relaunches Chrome normally afterward. Profiles and cookies remain on disk, so this requires no repeated login. `close-chrome` remains available for operator maintenance and stale processes.
+
+## Recovering a killed collector
+
+A harness `TaskStop` or direct process-tree kill can terminate the detached collector while ChatGPT continues generating. To stop generation, use `stop <run-id>`; to stop waiting, use the caller's timeout while leaving the collector alive.
+
+`fetch` reports `no_live_worker` (exit 6) after five seconds of absent-worker checks, instead of waiting indefinitely. This is a caller diagnostic and does not write a terminal `result.json`. To restore collection:
+
+```bash
+gpt-pro-relay fetch <run-id> --recover --timeout 60
+```
+
+If the worker is alive, this only waits. If it died, recovery opens the validated URL saved in `conversation.json` using the account in `meta.json`. It cannot paste or submit; the original completion gate, model audit, attachment-execution check, stop signal, and idle Chrome cleanup still apply. Concurrent collectors are excluded by the worker's per-run claim. An existing terminal result is never overwritten or rerun.
+
+Without a valid saved URL, recovery returns exit 6 and refuses to guess or resubmit. A non-blocking `--timeout 0` only reads existing results and never starts recovery. The `gpt-pro --run-id <id>` wrapper uses `fetch --recover` automatically.
+
+Before a new send, the relay waits for both the composer and model control; a missing control produces `composer_not_ready`. If a transient send signal disappears and the page remains an empty homepage without a captured conversation, it reports `send_landing_lost`. This leaves the submission outcome ambiguous and never triggers an automatic resend.
 
 ## Closing the Chrome tab mid-run
 

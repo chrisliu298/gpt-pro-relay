@@ -377,6 +377,35 @@ def test_monitor_and_finalize_cannot_resubmit():
         assert forbidden not in params
 
 
+async def test_transient_send_signal_then_empty_home_does_not_wait_forever(_finalize_env, tmp_path):
+    # A click initially passed the landing gate, then the empty homepage
+    # returned (the account-1 run). Keep the outcome ambiguous; never resend.
+    import asyncio
+    _finalize_env.setattr(cli, "SEND_LANDING_TIMEOUT", 0.0)
+
+    async def landed(*a, **kw):
+        return True
+
+    async def empty(*a):
+        return ""
+
+    async def absent(*a):
+        return 0
+
+    _finalize_env.setattr(cli, "_confirm_send_landed", landed)
+    _finalize_env.setattr(cli, "read_latest_assistant_text", empty)
+    _finalize_env.setattr(cli, "_user_turn_present", absent)
+    _finalize_env.setattr(cli, "_stop_button_count", absent)
+    page = _FinalizePage(url="https://chatgpt.com/")
+    now = asyncio.get_running_loop().time()
+    result = await _monitor_and_finalize(
+        page, run_dir=tmp_path, run_id="r1", deadline=now + 0.02,
+        send_ts=now, conv=_ConversationUrl(), err=_noop_err,
+    )
+    assert result["reason"] == "send_landing_lost"
+    assert not (tmp_path / "response.md").exists()
+
+
 async def test_monitor_completes_and_audits(_finalize_env, tmp_path):
     import asyncio
     _finalize_env.setattr(cli, "COMPLETION_STABLE_SECS", 0.0)

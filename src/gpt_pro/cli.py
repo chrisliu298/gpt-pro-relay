@@ -96,6 +96,9 @@ ATTACHED_PROMPT_EXECUTION_INSTRUCTION = (
 # Generous vs the ~2s real landing so a lagging URL capture never false-fails a
 # good send, while still terminating a proven no-op promptly.
 SEND_LANDING_TIMEOUT = 20.0
+# Two absent process checks separated by this grace distinguish a killed
+# collector from the short interval between submission and detached startup.
+WORKER_START_GRACE_SECS = 5.0
 # The only URL shape recovery will reopen: a canonical ChatGPT conversation route.
 # Matched exactly (not a prefix) and stripped of query/fragment so a benign
 # ?model=... or #frag can't repoint recovery at a different conversation. A home
@@ -814,10 +817,10 @@ def clear_stop_signal(run_dir: Path) -> None:
         pass
 
 
-def _worker_process_alive(run_id: str) -> bool:
-    """True if a `_run <run_id>` worker process exists (non-contending liveness).
+def _worker_process_alive(run_id: str, *, timeout: float = 5.0) -> bool:
+    """True if a `_run` or `_recover` worker for this run exists (non-contending liveness).
 
-    Used by `stop` ONLY to distinguish a dead worker from a slow one. It must NOT
+    Used by `stop` and `fetch` to distinguish a dead worker from a slow one. It must NOT
     contend on the run's `RunClaim`: the worker acquires that claim once,
     non-blocking, and reads a failed acquire as "another worker owns this run"
     and exits — so a reader that transiently held the claim as a probe could make
@@ -831,11 +834,11 @@ def _worker_process_alive(run_id: str) -> bool:
     # with `r1` (`r10`, `r1-x`) — which would report a dead target `pending`
     # forever. The worker id is the LAST argv, so anchor on a following space or
     # end of line.
-    pattern = r"gpt_pro\.cli _run " + re.escape(run_id) + r"([[:space:]]|$)"
+    pattern = r"gpt_pro\.cli (_run|_recover) " + re.escape(run_id) + r"([[:space:]]|$)"
     try:
         r = subprocess.run(
             ["pgrep", "-f", pattern],
-            capture_output=True, timeout=5,
+            capture_output=True, timeout=timeout,
             env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
@@ -1037,6 +1040,25 @@ COMPOSER_CHIP = (
     'button.__composer-pill[aria-haspopup="menu"], '
     'button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]'
 )
+COMPOSER_SELECTOR = (
+    '#prompt-textarea, [contenteditable="true"][role="textbox"], '
+    '[contenteditable="true"][aria-label="Ask ChatGPT"]'
+)
+
+
+async def wait_for_composer_ready(page, *, timeout: float = 30.0) -> bool:
+    """Wait for both controls, rather than mistaking a hydrated profile for readiness."""
+    try:
+        await page.wait_for_function("""([composer, chip]) => {
+            const visible = selector => Array.from(document.querySelectorAll(selector))
+                .some(el => el.getClientRects().length && !el.disabled);
+            return visible(composer) && visible(chip);
+        }""", arg=[COMPOSER_SELECTOR, COMPOSER_CHIP], timeout=timeout * 1000)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
 SEND_BUTTON = (
     '[data-testid="send-button"], '
     'button[aria-label="Send prompt"], '
@@ -1524,11 +1546,11 @@ async def _cmd_login_with_browser(account: int = 1) -> int:
 
 # ---- ask: parent-side submit + wait ----
 
-def _spawn_worker(run_id: str, run_dir: Path) -> None:
+def _spawn_worker(run_id: str, run_dir: Path, *, recover: bool = False) -> None:
     worker_stdout = (run_dir / "worker.stdout").open("ab")
     worker_stderr = (run_dir / "worker.stderr").open("ab")
     subprocess.Popen(
-        [sys.executable, "-m", "gpt_pro.cli", "_run", run_id],
+        [sys.executable, "-m", "gpt_pro.cli", "_recover" if recover else "_run", run_id],
         stdin=subprocess.DEVNULL,
         stdout=worker_stdout,
         stderr=worker_stderr,
@@ -1537,10 +1559,29 @@ def _spawn_worker(run_id: str, run_dir: Path) -> None:
     )
 
 
-async def _wait_for_result(run_dir: Path, *, poll_interval: float = 0.5, timeout: float | None = None) -> dict | None:
+def _saved_conversation_url(run_dir: Path) -> str | None:
+    try:
+        return parse_conversation_url(json.loads((run_dir / "conversation.json").read_text()).get("url"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _orphan_result(run_dir: Path) -> dict:
+    url = _saved_conversation_url(run_dir)
+    return {"status": "error", "reason": "no_live_worker", "exit_code": 6,
+            "run_id": run_dir.name, "run_dir": str(run_dir),
+            "conversation_url": url, "recoverable": url is not None,
+            "hint": "Use fetch --recover to resume collection from the saved conversation."
+                    if url else "No saved conversation URL; do not resubmit automatically."}
+
+
+async def _wait_for_result(run_dir: Path, *, poll_interval: float = 0.5,
+                           timeout: float | None = None, detect_orphan: bool = False) -> dict | None:
     """Polls run_dir/result.json until it appears or timeout. Returns parsed dict, or None on timeout."""
     result_path = run_dir / "result.json"
-    deadline = (time.time() + timeout) if timeout is not None else None
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    missing_since = None
+    next_probe = 0.0
     while True:
         if result_path.exists():
             try:
@@ -1548,9 +1589,29 @@ async def _wait_for_result(run_dir: Path, *, poll_interval: float = 0.5, timeout
             except json.JSONDecodeError:
                 await asyncio.sleep(0.1)
                 continue
-        if deadline is not None and time.time() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             return None
-        await asyncio.sleep(poll_interval)
+        now = time.monotonic()
+        if detect_orphan and now >= next_probe:
+            next_probe = now + min(1.0, max(0.01, WORKER_START_GRACE_SECS))
+            probe_timeout = 5.0 if deadline is None else min(5.0, deadline - now)
+            alive = _worker_process_alive(run_dir.name, timeout=probe_timeout)
+            now = time.monotonic()
+            if result_path.exists():
+                continue
+            if deadline is not None and now >= deadline:
+                return None
+            if alive:
+                missing_since = None
+            elif missing_since is None:
+                missing_since = now
+            if missing_since is not None and now - missing_since >= WORKER_START_GRACE_SECS:
+                # A worker may have atomically published just before exiting.
+                if result_path.exists():
+                    continue
+                return _orphan_result(run_dir)
+        delay = poll_interval if deadline is None else min(poll_interval, max(0.0, deadline - time.monotonic()))
+        await asyncio.sleep(delay)
 
 
 def _emit_terminal(result: dict, run_dir: Path, output_path: Path | None = None) -> int:
@@ -1574,6 +1635,8 @@ def _emit_terminal(result: dict, run_dir: Path, output_path: Path | None = None)
         return 3
     if status == "stopped":
         return 5  # halted by `stop`; no response artifact (discard policy)
+    if result.get("reason") == "no_live_worker":
+        return 6  # diagnostic only; never publish this as a terminal run result
     return 1
 
 
@@ -1675,7 +1738,7 @@ async def cmd_ask(args) -> int:
     if args.no_wait:
         return 0
 
-    result = await _wait_for_result(run_dir, timeout=args.generation_timeout)
+    result = await _wait_for_result(run_dir, timeout=args.generation_timeout, detect_orphan=True)
     if result is None:
         stderr_jsonl({
             "status": "pending",
@@ -1695,7 +1758,26 @@ async def cmd_fetch(args) -> int:
     if not run_dir.exists():
         stderr_jsonl({"status": "error", "reason": "not_found", "run_id": args.run_id})
         return 4
-    result = await _wait_for_result(run_dir, poll_interval=args.poll_interval, timeout=args.timeout)
+    started = time.monotonic()
+    result = await _wait_for_result(run_dir, poll_interval=args.poll_interval,
+                                    timeout=args.timeout, detect_orphan=True)
+    if (result and result.get("reason") == "no_live_worker"
+            and getattr(args, "recover", False) and result["recoverable"]):
+        # Do NOT take the writer claim here: a just-starting collector would
+        # lose to this reader and exit. Racing fetches may spawn two collectors,
+        # but the workers' non-blocking claim admits only one artifact writer;
+        # neither collector has a submission path.
+        remaining = None if args.timeout is None else max(0.0, args.timeout - (time.monotonic() - started))
+        if remaining is None or remaining > 0:
+            alive = _worker_process_alive(args.run_id, timeout=5.0 if remaining is None else min(5.0, remaining))
+            remaining = None if args.timeout is None else max(0.0, args.timeout - (time.monotonic() - started))
+            if not alive and not (run_dir / "result.json").exists() and (remaining is None or remaining > 0):
+                _spawn_worker(args.run_id, run_dir, recover=True)
+                stderr_jsonl({"status": "recovering", "run_id": args.run_id,
+                              "conversation_url": result["conversation_url"]})
+        remaining = None if args.timeout is None else max(0.0, args.timeout - (time.monotonic() - started))
+        result = await _wait_for_result(run_dir, poll_interval=args.poll_interval,
+                                       timeout=remaining, detect_orphan=True)
     if result is None:
         stderr_jsonl({
             "status": "pending",
@@ -2628,7 +2710,7 @@ async def _stop_button_count(page) -> int:
     ambiguous read is treated conservatively as "still running" and never
     false-completes a turn."""
     try:
-        return await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
+        return await page.locator('button[aria-label*="Stop"]:visible, [data-testid*="stop"]:visible').count()
     except Exception:
         if page.is_closed():
             raise RunPageClosed()
@@ -2820,6 +2902,7 @@ async def _monitor_and_finalize(
     snapshot_idx = 0
     next_snap = loop.time() + 5.0
     completed = False
+    empty_home_since = None
     stop_pending_logged = False
     while loop.time() < deadline:
         now = loop.time()
@@ -2883,6 +2966,24 @@ async def _monitor_and_finalize(
             snapshot_idx += 1
             next_snap = now + 30.0
         cur = await read_latest_assistant_text(page)
+        # A transient Stop/user signal can pass the initial landing gate and
+        # then disappear without a conversation ever being created (observed
+        # 2026-09-30). A sustained empty HOME is not Pro thinking. Keep the send
+        # outcome ambiguous and fail without resubmitting or publishing a body.
+        if not conv.get() and page.url.rstrip("/") == "https://chatgpt.com" and not cur:
+            if not await _user_turn_present(page) and await _stop_button_count(page) == 0:
+                if empty_home_since is None:
+                    empty_home_since = now
+                if now - empty_home_since >= SEND_LANDING_TIMEOUT:
+                    await safe_screenshot(page, run_dir / "error-send_landing_lost.png")
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="send_landing_lost", conversation_url=None)
+                    return err("send_landing_lost", {"conversation_url": None,
+                               "hint": "Submission outcome is unknown; do not resubmit automatically."})
+            else:
+                empty_home_since = None
+        else:
+            empty_home_since = None
         if cur != last_text:
             last_change = now
             last_text = cur
@@ -3120,6 +3221,12 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                     return err("needs_reauth")
                 log_stage("logged_in")
 
+                if not await wait_for_composer_ready(page):
+                    await safe_screenshot(page, run_dir / "error-composer_not_ready.png")
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="composer_not_ready")
+                    return err("composer_not_ready")
+
                 ok, chip_text = await ensure_pro_chip(page, run_dir=run_dir)
                 if not ok:
                     await safe_screenshot(page, run_dir / "error-model_select_failed.png")
@@ -3307,7 +3414,74 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
             pass
 
 
-async def cmd_run(args) -> int:
+async def _browser_recover(run_id: str, run_dir: Path) -> dict:
+    """Collect an existing conversation under the normal browser lifetime rules.
+
+    This path never reads prompt.md and has no paste/composer/send operation.
+    The caller owns RunClaim, so recovery and the original worker cannot both
+    publish. It also reuses the account lease and slot to protect sibling runs.
+    """
+    def err(reason, extra=None):
+        return {"status": "error", "reason": reason, "run_id": run_id,
+                "run_dir": str(run_dir), "exit_code": 1, **(extra or {})}
+
+    url = _saved_conversation_url(run_dir)
+    if not url:
+        return err("recovery_url_missing")
+    restored = False
+    try:
+        for line in (run_dir / "worker.stderr").read_text().splitlines():
+            try:
+                restored |= json.loads(line).get("stage") == "instruction_boundary_restored"
+            except (ValueError, AttributeError):
+                pass
+    except OSError:
+        pass
+    network_log = []
+    log_stage("collector_recovery_started", run_id=run_id, conversation_url=url)
+    with ChromeActivityLease() as lease:
+        try:
+            with ParallelSlot(get_max_parallel()) as slot:
+                ensure_shared_chrome_running(skip_slot_id=slot.slot_id)
+                async with async_playwright() as pw:
+                    ctx = await connect_shared_chrome(pw)
+                    page = await ctx.new_page()
+                    try:
+                        _attach_response_logger(page, network_log)
+                        await _install_modal_dismissers(page)
+                        loop = asyncio.get_running_loop()
+                        deadline = loop.time() + DEFAULT_GENERATION_TIMEOUT
+                        reason = await _recover_navigate(ctx, page, url, deadline=deadline)
+                        if reason:
+                            return err("page_recovery_failed", {"recovery_reason": reason, "conversation_url": url})
+                        conv = _ConversationUrl()
+                        conv.capture(url)
+                        # Retain the original capture timestamp and breadcrumb.
+                        conv._persisted = True
+                        result, page = await _run_postsend(
+                            ctx, page, run_dir=run_dir, run_id=run_id,
+                            deadline=deadline, send_ts=loop.time(), conv=conv,
+                            network_log=network_log, err=err,
+                            instruction_boundary_restored=restored,
+                        )
+                        return result
+                    finally:
+                        try:
+                            await asyncio.wait_for(page.close(), timeout=5.0)
+                        except Exception as e:
+                            log_stage("page_close_skipped", exception=f"{type(e).__name__}: {e}")
+        except Exception as e:
+            log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
+            return err("worker_exception", {"exception": f"{type(e).__name__}: {e}"})
+        finally:
+            close_chrome_if_idle(lease)
+            try:
+                atomic_write(run_dir / "recovery-network.json", json.dumps(network_log))
+            except OSError as e:
+                log_stage("recovery_network_log_skipped", exception=str(e))
+
+
+async def cmd_run(args, *, recover: bool = False) -> int:
     validate_run_id(args.run_id)
     run_dir = RUNS / args.run_id
     # Claim the run for this worker's whole lifetime — this is what makes the
@@ -3328,12 +3502,12 @@ async def cmd_run(args) -> int:
         })
         return 1
     try:
-        return await _run_claimed(args.run_id, run_dir)
+        return await _run_claimed(args.run_id, run_dir, recover=recover)
     finally:
         claim.release()
 
 
-async def _run_claimed(run_id: str, run_dir: Path) -> int:
+async def _run_claimed(run_id: str, run_dir: Path, *, recover: bool = False) -> int:
     """The worker body, holding this run's `RunClaim`."""
     # Never rerun a run that already reached a terminal result — checked FIRST,
     # before any validation that could write. A hand-run `_run` (or any respawn)
@@ -3364,7 +3538,7 @@ async def _run_claimed(run_id: str, run_dir: Path) -> int:
             return existing.get("exit_code", 0)
 
     prompt_path = run_dir / "prompt.md"
-    if not run_dir.exists() or not prompt_path.exists():
+    if not run_dir.exists() or (not recover and not prompt_path.exists()):
         result = {
             "status": "error",
             "reason": "missing_prompt",
@@ -3393,8 +3567,11 @@ async def _run_claimed(run_id: str, run_dir: Path) -> int:
         return 1
 
     configure_account(account)
-    prompt_text = prompt_path.read_text()
-    result = await _browser_run(run_id, run_dir, prompt_text)
+    if recover:
+        result = await _browser_recover(run_id, run_dir)
+    else:
+        prompt_text = prompt_path.read_text()
+        result = await _browser_run(run_id, run_dir, prompt_text)
     result.setdefault("account", account)
     atomic_write(run_dir / "result.json", json.dumps(result))
     return result.get("exit_code", 1)
@@ -3469,6 +3646,8 @@ def main() -> int:
     fetch_p.add_argument("--timeout", type=float, default=None,
                         help="Max seconds to wait. Default infinite. 0 = non-blocking check.")
     fetch_p.add_argument("--poll-interval", type=float, default=0.5)
+    fetch_p.add_argument("--recover", action="store_true",
+                        help="Resume a dead collector from its saved conversation URL; never sends a prompt.")
     fetch_p.add_argument("--output", type=Path, default=None,
                         help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged.")
 
@@ -3479,6 +3658,8 @@ def main() -> int:
 
     run_p = sub.add_parser("_run", help=argparse.SUPPRESS)
     run_p.add_argument("run_id")
+    recover_p = sub.add_parser("_recover", help=argparse.SUPPRESS)
+    recover_p.add_argument("run_id")
 
     args = p.parse_args()
     if args.cmd == "login":
@@ -3493,6 +3674,8 @@ def main() -> int:
         return asyncio.run(cmd_stop(args))
     if args.cmd == "_run":
         return asyncio.run(cmd_run(args))
+    if args.cmd == "_recover":
+        return asyncio.run(cmd_run(args, recover=True))
     if args.cmd == "close-chrome":
         accounts = range(1, ACCOUNT_COUNT + 1) if args.account == "all" else [int(args.account)]
         exit_code = 0

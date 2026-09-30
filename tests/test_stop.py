@@ -106,7 +106,7 @@ def test_worker_process_alive_pattern_is_escaped_and_anchored(monkeypatch):
     rid = "ask-2026.01-r1"
     cli._worker_process_alive(rid)
     pattern = captured["args"][2]  # ["pgrep", "-f", <pattern>]
-    assert pattern == r"gpt_pro\.cli _run " + _re.escape(rid) + r"([[:space:]]|$)"
+    assert pattern == r"gpt_pro\.cli (_run|_recover) " + _re.escape(rid) + r"([[:space:]]|$)"
     assert _re.escape(rid) in pattern  # the id's `.` / `-` are escaped, not wildcards
 
 
