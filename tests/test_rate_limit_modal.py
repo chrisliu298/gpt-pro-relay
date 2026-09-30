@@ -185,25 +185,31 @@ async def test_install_modal_dismissers_survives_a_failing_registration(_stages)
     assert "beacon_dismisser_install_skipped" in skipped
 
 
-# ---- _focus_and_paste is locator-bound (the dismisser's focus guarantee) ----
+# ---- _focus_and_paste is element-bound and never touches the pasteboard ----
 #
 # The dismisser is a locator handler: it only fires at an action's actionability
-# checkpoint. A bare `page.keyboard.press("Meta+V")` has no such checkpoint, so a
-# modal that mounts in the gap between composer.click() and the paste would steal
-# focus and the paste would land in the modal. `_focus_and_paste` must therefore
-# paste via the composer *locator* (`composer.press`), which re-runs the handler
-# checkpoint and re-focuses the composer immediately before dispatching the keys.
+# checkpoint, so `_focus_and_paste` first clicks the composer *locator* (handler
+# checkpoint + focus). The paste itself is a ClipboardEvent dispatched on the
+# composer element, so a modal mounting afterwards cannot redirect it the way it
+# could steal a focus-following key press, and a page-level keyboard is never
+# used. No pbcopy/pbpaste: the human's clipboard is never read or written.
 
 class _RecordingComposer:
-    def __init__(self):
+    def __init__(self, handled=True):
         self.clicked = False
         self.pressed = []
+        self.evaluated = []
+        self.handled = handled
 
     async def click(self):
         self.clicked = True
 
     async def press(self, key, **_kw):
         self.pressed.append(key)
+
+    async def evaluate(self, js, arg=None):
+        self.evaluated.append((js, arg))
+        return self.handled
 
 
 class _RecordingKeyboard:
@@ -218,43 +224,34 @@ class _PastePage:
     def __init__(self):
         self.keyboard = _RecordingKeyboard()
 
-    async def wait_for_selector(self, *_a, **_k):
-        return object()  # send button "mounted" → paste settled
-
-
-class _NoLock:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-class _FakeCompleted:
-    stdout = ""
-
 
 @pytest.fixture
 def _paste_env(monkeypatch, _stages):
-    async def _noop_async(*_a, **_k):
-        return None
+    def _forbidden(*_a, **_k):
+        raise AssertionError("paste must not activate Chrome or touch the pasteboard")
 
-    monkeypatch.setattr(cli, "UiClipboardLock", _NoLock)
-    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "bring_tab_to_front", _noop_async)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: _FakeCompleted())
+    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", _forbidden)
+    monkeypatch.setattr(cli, "bring_tab_to_front", _forbidden)
+    monkeypatch.setattr(cli.subprocess, "run", _forbidden)
     return monkeypatch
 
 
-async def test_focus_and_paste_uses_locator_press_not_bare_keyboard(_paste_env):
+async def test_focus_and_paste_dispatches_on_the_composer_element(_paste_env):
     page = _PastePage()
     composer = _RecordingComposer()
     await cli._focus_and_paste(page, composer, "the prompt body")
-    # The paste is dispatched through the composer locator (handler checkpoint +
-    # focus), never the un-checkpointed page-level keyboard.
-    assert composer.pressed == ["Meta+V"]
-    assert page.keyboard.pressed == []
     assert composer.clicked is True
+    assert [arg for _js, arg in composer.evaluated] == ["the prompt body"]
+    assert "ClipboardEvent('paste'" in composer.evaluated[0][0]
+    assert composer.pressed == []
+    assert page.keyboard.pressed == []
+
+
+async def test_unhandled_paste_fails_closed_before_send(_paste_env):
+    # A synthetic paste has no native default action: if no handler consumed it,
+    # nothing reached the composer. Fail now rather than wait out the upload gate.
+    with pytest.raises(RuntimeError, match="paste_not_handled"):
+        await cli._focus_and_paste(_PastePage(), _RecordingComposer(handled=False), "x")
 
 
 async def test_registration_failure_never_aborts_the_run(_stages):

@@ -176,7 +176,6 @@ def test_launch_uses_validated_beta_app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "LaunchLock", _DummyLock)
     monkeypatch.setattr(cli, "_slots_held", lambda **_k: False)
     monkeypatch.setattr(cli, "_kill_chrome_orphans", lambda: None)
-    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda: None)
     monkeypatch.setattr(cli.time, "sleep", lambda *_a: None)
     executable = beta / "Contents" / "MacOS" / "Google Chrome Beta"
     monkeypatch.setattr(
@@ -199,9 +198,12 @@ def test_launch_uses_validated_beta_app(tmp_path, monkeypatch):
 
     with cli.ChromeActivityLease():
         assert cli.ensure_shared_chrome_running() is True
-    assert calls["popen"][:5] == [
-        "/usr/bin/open", "-n", "-a", str(beta), "--args",
+    # -g plus --no-startup-window: neither `open` nor Chrome's own first window
+    # may take the macOS foreground from the human at the keyboard.
+    assert calls["popen"][:6] == [
+        "/usr/bin/open", "-g", "-n", "-a", str(beta), "--args",
     ]
+    assert "--no-startup-window" in calls["popen"]
     assert f"--user-data-dir={cli.PROFILE}" in calls["popen"]
 
 

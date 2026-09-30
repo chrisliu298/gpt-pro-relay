@@ -200,27 +200,19 @@ def _no_sleep(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _stub_slow_path_side_effects(monkeypatch):
-    """`ensure_pro_chip`'s slow path takes UiClipboardLock and drives the OS
-    focus; stub those so the test exercises only the menu logic."""
-    monkeypatch.setattr(cli, "UiClipboardLock", lambda: _NullCtx())
-    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda: None)
-
-    async def _noop_front(_page):
-        return None
+    """Activating Chrome or switching its active tab fails the test: the slow
+    path must work with Chrome in the background."""
+    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", _forbidden_activation)
+    monkeypatch.setattr(cli, "bring_tab_to_front", _forbidden_activation)
 
     async def _noop_shot(_page, _path, **_kw):
         return None
 
-    monkeypatch.setattr(cli, "bring_tab_to_front", _noop_front)
     monkeypatch.setattr(cli, "safe_screenshot", _noop_shot)
 
 
-class _NullCtx:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+def _forbidden_activation(*_a, **_k):
+    raise AssertionError("worker path must not activate Chrome")
 
 
 # ---- ensure_pro_chip: fast path ------------------------------------------

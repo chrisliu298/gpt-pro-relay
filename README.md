@@ -177,7 +177,7 @@ A run leaves **at most one** of those five names (a failure before extraction pu
 
 ## Concurrency
 
-New runs are distributed evenly by count across the three accounts. Within each account, up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share that account's Chrome process; additional runs for that account wait in its own slot pool. Lower it to `1` if account-side anti-abuse appears. The macOS clipboard lock remains global because all three browsers share one physical pasteboard.
+New runs are distributed evenly by count across the three accounts. Within each account, up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share that account's Chrome process; additional runs for that account wait in its own slot pool. Lower it to `1` if account-side anti-abuse appears.
 
 When a worker, `login`, or `doctor` finishes, it closes that account's Chrome if it is the last active user. Concurrent runs keep sharing the process until the last one exits; a newly arriving run is excluded from the shutdown window and relaunches Chrome normally afterward. Profiles and cookies remain on disk, so this requires no repeated login. `close-chrome` remains available for operator maintenance and stale processes.
 
@@ -217,8 +217,8 @@ Fix: open the app once from the Mac's own screen and approve the prompt (or **Op
 What is *not* established: in the one observed incident, `xattr -dr com.apple.quarantine` alone did **not** release the process, while a broader `xattr -cr` (which also removed `com.apple.FinderInfo`) coincided with success — but a human approval click landed in the same window, so the two were never isolated. Do not treat `xattr -cr` as the known remedy. It clears *every* attribute on *every* bundle member, which is a wider security bypass than the problem calls for. Prefer the interactive approval; reach for attribute clearing only as a deliberate, trusted-source last resort.
 
 ## Known limitations
-- ChatGPT converts large native pastes into a `Pasted markdown` attachment at a frontend-controlled threshold. The relay detects the resulting empty composer rather than hard-coding that threshold, inserts and verifies a short top-level execution instruction before Send, and fails pre-send with `instruction_boundary_lost_before_send` if it cannot prove that boundary. If the backend nevertheless only acknowledges the file and offers to continue, the run fails with `instruction_boundary_lost` and publishes the diagnostic body as `response.incomplete.md`.
-- Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
+- ChatGPT converts large pastes into a `Pasted markdown` attachment at a frontend-controlled threshold. The relay detects the resulting empty composer rather than hard-coding that threshold, inserts and verifies a short top-level execution instruction before Send, and fails pre-send with `instruction_boundary_lost_before_send` if it cannot prove that boundary. If the backend nevertheless only acknowledges the file and offers to continue, the run fails with `instruction_boundary_lost` and publishes the diagnostic body as `response.incomplete.md`.
+- Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); the copied text is captured inside the page, so your system clipboard is never read or written. Falls back to `innerText` if the Copy button isn't reachable.
 - Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
 

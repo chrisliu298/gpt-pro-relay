@@ -21,7 +21,6 @@ STATE = Path.home() / ".gpt-pro"
 RUNS = STATE / "runs"
 LAUNCH_LOCK = STATE / "launch.lock"
 CHROME_ACTIVITY_LOCK = STATE / "chrome-activity.lock"
-CLIPBOARD_LOCK = STATE / "clipboard.lock"
 CLAIMS = STATE / "claims"  # per-run claim locks; see RunClaim
 SLOT_LOCK_DIR = STATE / "slots"
 ACCOUNT_COUNT = 3
@@ -212,6 +211,9 @@ def get_max_parallel() -> int:
 #  - --password-store=basic, --use-mock-keychain, --disable-features=
 #    DestroyProfileOnBrowserClose (cookie persistence per CLAUDE.local.md memory)
 #  - --window-size pins the OS window (zero-area windows = white-screen)
+#  - --no-startup-window: Chrome activates itself when it opens its startup
+#    window, even under `open -g`; `_ensure_background_window` opens the first
+#    window instead, without taking the macOS foreground
 CHROME_OPEN_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
@@ -220,6 +222,7 @@ CHROME_OPEN_ARGS = [
     "--use-mock-keychain",
     "--disable-features=DestroyProfileOnBrowserClose,DialMediaRouteProvider,MediaRouter,Translate,HttpsUpgrades,PaintHolding",
     "--window-size=1280,800",
+    "--no-startup-window",
 ]
 
 
@@ -413,8 +416,12 @@ def bind_chrome_compositor_surface() -> None:
     bundle ambiguity (interactive Chrome + gpt-pro Chrome share the bundle) and
     needs no Accessibility permission. Idempotent: if Chrome is already
     foreground the JXA call is a no-op. Does NOT call page.bring_to_front, so
-    a concurrent worker mid-paste in another tab is not disturbed. Safe to
-    call from anywhere; cheap when not needed.
+    a concurrent worker mid-paste in another tab is not disturbed.
+
+    Only interactive `login` calls this now. Workers and `doctor` never activate
+    Chrome: a window created in the background (`_ensure_background_window`)
+    renders and screenshots normally, and CDP input reaches its tab without OS
+    focus (measured live 2026-09-29).
     """
     if sys.platform != "darwin":
         return
@@ -441,9 +448,9 @@ def bind_chrome_compositor_surface() -> None:
 async def bring_tab_to_front(page) -> None:
     """page.bring_to_front() — switches Chrome's active tab to this worker's page.
 
-    UNSAFE outside UiClipboardLock: another worker mid-paste expects its tab
-    to stay frontmost so its `Meta+V` lands in its composer. Only call from
-    within the focus+paste / focus+copy critical sections that hold the lock.
+    Only interactive `login` calls this, so the human sees the sign-in tab.
+    Worker paths never need it: CDP delivers input to the target tab whether or
+    not it is Chrome's active tab.
     """
     try:
         await page.bring_to_front()
@@ -572,9 +579,9 @@ def ensure_shared_chrome_running(port: int | None = None, skip_slot_id: int | No
     Callers must therefore run inside their own `ChromeActivityLease`; one that
     holds no lease cannot prove sole use and fails closed instead of killing.
 
-    On the launch path, also bind the CoreAnimation surface once. Followers
-    don't need to bind — Chrome's compositor stays bound for the rest of its
-    lifetime once activated.
+    The launch never activates Chrome: `open -g` plus `--no-startup-window`
+    keeps it behind the human's frontmost app, and `connect_shared_chrome`
+    creates the first window in the background.
     """
     if port is None:
         port = LAUNCH_DEBUG_PORT
@@ -618,7 +625,7 @@ def ensure_shared_chrome_running(port: int | None = None, skip_slot_id: int | No
             _kill_chrome_orphans()
             argv = _chrome_open_argv(port)
             subprocess.Popen(
-                ["/usr/bin/open", "-n", "-a", str(app), "--args", *argv],
+                ["/usr/bin/open", "-g", "-n", "-a", str(app), "--args", *argv],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -628,7 +635,6 @@ def ensure_shared_chrome_running(port: int | None = None, skip_slot_id: int | No
                 if probe_cdp(port):
                     _require_running_chrome_app(app, port)
                     log_stage("chrome_cdp_ready", port=port)
-                    bind_chrome_compositor_surface()
                     return True
                 time.sleep(0.3)
             raise RuntimeError(_cdp_timeout_message(port))
@@ -654,10 +660,37 @@ async def connect_shared_chrome(pw, port: int | None = None):
     while True:
         browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         if browser.contexts:
-            return browser.contexts[0]
+            ctx = browser.contexts[0]
+            await _ensure_background_window(browser, ctx)
+            return ctx
         if time.time() >= deadline:
             raise RuntimeError("connect_over_cdp returned no contexts after 5s")
         await asyncio.sleep(0.25)
+
+
+async def _ensure_background_window(browser, ctx) -> None:
+    """Open a background window if Chrome has none, so `ctx.new_page()` never
+    takes the macOS foreground.
+
+    Chrome launches with `--no-startup-window`, and a human may close the window
+    of a running Chrome. With no window, `ctx.new_page()` opens one and Chrome
+    activates itself. A CDP window created with `background: True` does not, and
+    later `new_page()` tabs land in it. WebUI targets (`chrome://…`) are not a
+    usable window. Concurrent callers can each create one; an extra blank window
+    is harmless and closes with Chrome. Fail-open: without it, `new_page()` still
+    works and merely steals focus.
+    """
+    if any(not p.url.startswith("chrome://") for p in ctx.pages):
+        return
+    try:
+        cdp = await browser.new_browser_cdp_session()
+        await cdp.send("Target.createTarget", {
+            "url": "about:blank", "newWindow": True, "background": True,
+        })
+        await cdp.detach()
+        log_stage("chrome_background_window_created")
+    except Exception as e:
+        log_stage("chrome_background_window_skipped", exception=f"{type(e).__name__}: {e}")
 
 
 def _kill_chrome_orphans() -> None:
@@ -1227,12 +1260,11 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
     """Make the composer chip read the "Pro" effort tier. Returns (ok, observed_text).
 
     Idempotent fast path: if the chip already reads `is_pro_label` we no-op
-    without taking any lock — the typical case, since a fresh page defaults to
+    without opening the menu — the typical case, since a fresh page defaults to
     GPT-6 Pro.
 
-    Slow path (chip in a wrong effort): held under `UiClipboardLock` plus a
-    `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
-    and `keyboard.press` on it can steal focus from a concurrent worker's tab. It
+    Slow path (chip in a wrong effort), without activating Chrome — CDP clicks
+    and key presses reach this tab even in the background. It
     opens the chip menu and drives the Power effort slider to its top (Pro) tier
     (see `_drive_power_slider_to_max`). It does NOT touch the model radios — the
     model comes from the account default and is verified fail-closed post-send by
@@ -1244,51 +1276,47 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
     if is_pro_label(text):
         return True, text
 
-    with UiClipboardLock():
-        bind_chrome_compositor_surface()
-        await bring_tab_to_front(page)
+    try:
+        await _open_chip_menu(page, chip)
+    except Exception as e:
+        await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
+        return False, text
 
-        try:
-            await _open_chip_menu(page, chip)
-        except Exception as e:
-            await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
-            (run_dir / "error.html").write_text(await page.content())
-            log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
-            return False, text
+    # Drive the Power effort slider to its top (Pro) tier. The named effort
+    # radios are gone (2026-08-28 redesign); effort is now a slider whose max
+    # tier is Pro. `reached_max` is the slider-value check (aria-valuenow ==
+    # aria-valuemax); the chip-label check below is the second, name-anchored
+    # gate. Both must pass, so we fail closed if either the slider does not
+    # max OR the top tier is no longer labeled "Pro".
+    try:
+        reached_max = await _drive_power_slider_to_max(page)
+    except Exception as e:
+        await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
+        await page.keyboard.press("Escape")
+        return False, text
+    if not reached_max:
+        await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="chip_menuitem_missing", detail="power_slider_not_max")
+        await page.keyboard.press("Escape")
+        return False, text
 
-        # Drive the Power effort slider to its top (Pro) tier. The named effort
-        # radios are gone (2026-08-28 redesign); effort is now a slider whose max
-        # tier is Pro. `reached_max` is the slider-value check (aria-valuenow ==
-        # aria-valuemax); the chip-label check below is the second, name-anchored
-        # gate. Both must pass, so we fail closed if either the slider does not
-        # max OR the top tier is no longer labeled "Pro".
-        try:
-            reached_max = await _drive_power_slider_to_max(page)
-        except Exception as e:
-            await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
-            (run_dir / "error.html").write_text(await page.content())
-            log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
-            await page.keyboard.press("Escape")
-            return False, text
-        if not reached_max:
-            await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
-            (run_dir / "error.html").write_text(await page.content())
-            log_stage("error", reason="chip_menuitem_missing", detail="power_slider_not_max")
-            await page.keyboard.press("Escape")
-            return False, text
-
-        # Dismiss the menu, then confirm the chip settled on the "Pro" tier — the
-        # chip shows "Thinking effort" while the menu is open, so this read must
-        # follow the close. Poll up to 5s for it to settle.
-        await _close_chip_menu(page, chip)
-        deadline = time.time() + 5.0
-        final_text = text
-        while time.time() < deadline:
-            final_text = (await chip.inner_text()).strip()
-            if is_pro_label(final_text):
-                return True, final_text
-            await asyncio.sleep(0.2)
-        return False, final_text
+    # Dismiss the menu, then confirm the chip settled on the "Pro" tier — the
+    # chip shows "Thinking effort" while the menu is open, so this read must
+    # follow the close. Poll up to 5s for it to settle.
+    await _close_chip_menu(page, chip)
+    deadline = time.time() + 5.0
+    final_text = text
+    while time.time() < deadline:
+        final_text = (await chip.inner_text()).strip()
+        if is_pro_label(final_text):
+            return True, final_text
+        await asyncio.sleep(0.2)
+    return False, final_text
 
 
 # GPT-6 is currently exposed through the rolling "Latest" model radio (the menu
@@ -1412,9 +1440,8 @@ async def _cmd_doctor_with_browser(account: int = 1) -> int:
         ctx = await connect_shared_chrome(pw)
         page = await ctx.new_page()
         try:
-            # bind only, NOT bring_to_front: a worker may be mid-paste in another
-            # tab. Screenshots work on background tabs in a windowed Chrome.
-            bind_chrome_compositor_surface()
+            # No activation: screenshots and chip reads work with Chrome in the
+            # background, and doctor must not take the foreground from the human.
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             await pin_viewport_cdp(ctx, page)
             ok = await wait_for_login(ctx, page, timeout=30.0)
@@ -1774,62 +1801,40 @@ async def _log_response(resp, log: list) -> None:
         pass
 
 
+PASTE_EVENT_JS = """(composer, text) => {
+    const data = new DataTransfer();
+    data.setData('text/plain', text);
+    const event = new ClipboardEvent('paste', {
+        clipboardData: data, bubbles: true, cancelable: true,
+    });
+    composer.focus();
+    return !composer.dispatchEvent(event);
+}"""
+
+
 async def _focus_and_paste(page, composer, prompt_text: str) -> None:
-    """Hold UiClipboardLock; activate Chrome; focus composer; pbcopy + Cmd+V; wait for paste to settle; restore clipboard.
+    """Focus the composer, then paste the prompt without the system pasteboard.
 
-    The lock spans focus + paste, not just pbcopy/pbpaste, because `Meta+V` is
-    dispatched by Chrome to the OS-active window's active tab — a concurrent
-    worker that calls `bring_to_front()` mid-keystroke would redirect this
-    paste to its own composer. We also wait for ProseMirror to actually ingest
-    the paste (composer text length reaches a sentinel) before releasing the
-    lock — `composer.press("Meta+V")` returns when the CDP event is dispatched,
-    not when the paste handler has finished. Without the wait, the next worker
-    can pbcopy something else while ProseMirror is still consuming our paste.
+    The paste is a `ClipboardEvent('paste')` carrying the prompt in its
+    `DataTransfer`, dispatched on the composer element. ChatGPT's paste handler
+    consumes it exactly like a real Cmd+V — including converting a large paste
+    into a "Pasted text" attachment (verified live 2026-09-29 on a 352K-char
+    paste) — so the human's clipboard is never read or written and parallel
+    workers need no lock. Why a paste at all, not `keyboard.insert_text`:
+    ProseMirror re-renders the whole document on synthetic input events and
+    chokes on multi-hundred-KB inputs; the paste handler is the optimized path.
 
-    Why pbcopy + Cmd+V instead of `keyboard.insert_text`: ProseMirror re-renders
-    the whole document on synthetic input events and chokes on multi-hundred-KB
-    inputs; Cmd+V hits the contenteditable's optimized paste handler. Saves and
-    restores the user's clipboard since the Mac mini may be in interactive use.
+    `composer.click()` goes first as the actionability checkpoint that runs the
+    modal dismissers (`_install_modal_dismissers`) and focuses the composer.
+    Because the event is dispatched on the composer element itself, a modal
+    mounting after the click cannot redirect it the way it could steal a
+    focus-following key press. A synthetic paste has no native default action:
+    unless a handler consumed it (`defaultPrevented`), nothing reached the
+    composer, so fail closed before Send rather than wait out the upload gate.
     """
-    with UiClipboardLock():
-        bind_chrome_compositor_surface()
-        await bring_tab_to_front(page)
-        try:
-            before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-        except Exception:
-            before = None
-        try:
-            await composer.click()
-            subprocess.run(["pbcopy"], input=prompt_text, text=True, check=True, timeout=10)
-            # Locator-bound paste (composer.press), NOT page.keyboard.press. The
-            # rate-limit modal can mount in the gap between composer.click() and
-            # this line (a conversation-list fetch 429s during the synchronous
-            # pbcopy) and steal focus — a bare keyboard.press has no actionability
-            # checkpoint, so it would dispatch Meta+V into the modal and lose the
-            # paste. composer.press re-runs the _install_rate_limit_dismisser
-            # handler checkpoint (dismissing any modal) and re-focuses the
-            # composer immediately before dispatching the same Meta+V key event
-            # that hits ProseMirror's optimized native-paste handler.
-            await composer.press("Meta+V")
-            # Wait until the send button mounts before releasing the lock. The
-            # send button is only mounted when the composer has non-empty
-            # content — its presence proves ProseMirror's paste handler ran
-            # to completion. Without this gate, the next worker can pbcopy
-            # over our prompt while our paste handler is still reading the
-            # OS clipboard. Same selector used by the actual send-click below.
-            try:
-                await page.wait_for_selector(
-                    SEND_BUTTON,
-                    timeout=10000, state="visible",
-                )
-            except Exception as e:
-                log_stage("paste_settle_skipped", exception=f"{type(e).__name__}: {e}")
-        finally:
-            if before is not None:
-                try:
-                    subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
-                except Exception:
-                    pass
+    await composer.click()
+    if not await composer.evaluate(PASTE_EVENT_JS, prompt_text):
+        raise RuntimeError("paste_not_handled: composer ignored the paste event")
 
 
 def _visible_composer_text(text: str | None) -> str:
@@ -1982,28 +1987,22 @@ async def _copy_button_present(page) -> bool:
 
 
 async def _copy_button_extract(page) -> str | None:
-    """Hold UiClipboardLock; activate Chrome + bring tab to front; click Copy; read pbpaste; ALWAYS restore.
+    """Click the latest turn's Copy button and capture its text in-page.
 
-    Preserves markdown fidelity (math, code fences, tables) where innerText mangles them.
-    Returns None if the copy didn't change the clipboard (button missing, permission denied,
-    not on macOS, etc.) — caller should fall back to innerText.
+    Preserves markdown fidelity (math, code fences, tables) where innerText mangles
+    them. The system pasteboard is never read or written: for the duration of the
+    click, `navigator.clipboard.write` (what ChatGPT's Copy uses, with a
+    `text/plain` ClipboardItem) and `writeText` are shadowed on this page's
+    clipboard object to capture the text instead, then restored. So a human
+    copying/pasting on the same Mac is never disturbed, and parallel workers
+    need no lock. Verified live 2026-09-29: byte-identical to the earlier
+    pbpaste-based extraction on 81-, 4156-, and 27638-char answers.
 
-    The lock spans baseline pbpaste + click + post-click pbpaste + restore so a
-    concurrent worker's clipboard write cannot race into our `after` read. The
-    `try/finally` ensures `before` is restored whenever a Copy click was attempted,
-    even on early-return paths — otherwise we'd leak the assistant's response into
-    the user's clipboard if pbpaste(after) raises.
+    Returns None if nothing was captured (button missing, ChatGPT switched to a
+    copy path we don't shadow, 5s timeout) — caller falls back to innerText.
     """
-    with UiClipboardLock():
-        bind_chrome_compositor_surface()
-        await bring_tab_to_front(page)
-        try:
-            before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-        except Exception:
-            return None
-
-        try:
-            clicked = await page.evaluate("""() => {
+    try:
+        copied = await page.evaluate("""async () => {
                 const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
                 const last = msgs[msgs.length - 1];
                 let btn = null;
@@ -2036,36 +2035,43 @@ async def _copy_button_extract(page) -> str | None:
                         }) || null;
                     }
                 }
-                if (!btn) return false;
-                btn.click();
-                return true;
+                if (!btn) return null;
+                const clipboard = navigator.clipboard;
+                const names = ['write', 'writeText'];
+                const saved = names.map(n => Object.getOwnPropertyDescriptor(clipboard, n));
+                let captured = null;
+                let settle;
+                const done = new Promise(resolve => { settle = resolve; });
+                clipboard.writeText = async text => { captured = String(text); settle(); };
+                clipboard.write = async items => {
+                    for (const item of items) {
+                        if (item.types.includes('text/plain')) {
+                            captured = await (await item.getType('text/plain')).text();
+                            break;
+                        }
+                    }
+                    settle();
+                };
+                try {
+                    btn.click();
+                    await Promise.race([done, new Promise(r => setTimeout(r, 5000))]);
+                } finally {
+                    names.forEach((n, i) => {
+                        if (saved[i]) Object.defineProperty(clipboard, n, saved[i]);
+                        else delete clipboard[n];
+                    });
+                }
+                return captured;
             }""")
-        except Exception:
-            # A close mid-extract must recover, not silently downgrade a clean
-            # markdown answer to stale innerText. A live-page miss keeps None.
-            if page.is_closed():
-                raise RunPageClosed()
-            return None
-        if not clicked:
-            return None
-
-        # Click was attempted — from here, always restore `before` no matter how we exit.
-        try:
-            await asyncio.sleep(0.6)
-            try:
-                after = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-            except Exception:
-                return None
-            if after and after != before and after.strip():
-                return after
-            return None
-        finally:
-            # Restore in finally so an exception in pbpaste-after, or early return,
-            # cannot leave the assistant's just-copied response on the user's clipboard.
-            try:
-                subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
-            except Exception:
-                pass
+    except Exception:
+        # A close mid-extract must recover, not silently downgrade a clean
+        # markdown answer to stale innerText. A live-page miss keeps None.
+        if page.is_closed():
+            raise RunPageClosed()
+        return None
+    if copied and copied.strip():
+        return copied
+    return None
 
 
 class _FlockGuard:
@@ -2247,19 +2253,6 @@ class RunClaim(_FlockGuard):
     """
     def __init__(self, run_id: str, *, blocking: bool = True):
         super().__init__(CLAIMS / f"{run_id}.lock", blocking=blocking)
-
-
-class UiClipboardLock(_FlockGuard):
-    """Held across the foreground+focus+pbcopy+Meta+V transaction (paste path) and
-    across baseline pbpaste + click-Copy + post-click pbpaste + restore (extract path).
-
-    Wider than just `pbpaste` because `Meta+V` follows OS focus and ChatGPT's
-    Copy-button onClick uses `navigator.clipboard.writeText` which requires
-    document focus. Two parallel workers must not interleave these phases or
-    they will silently swap each other's prompts/responses through the global
-    macOS pasteboard."""
-    def __init__(self):
-        super().__init__(CLIPBOARD_LOCK)
 
 
 class ParallelSlot:
@@ -3096,11 +3089,10 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
             # (and historically that has terminated Chrome). The Playwright
             # `async with` exit drops our connection without killing Chrome.
             #
-            # We do NOT call bring_tab_to_front or bind_chrome_compositor_surface
-            # here. Those run only inside UiClipboardLock (in _focus_and_paste
-            # and _copy_button_extract). An early bring_to_front would hijack a
-            # concurrent worker's mid-paste keystroke. Screenshots work on
-            # background tabs in a windowed Chrome.
+            # Workers never call bring_tab_to_front or
+            # bind_chrome_compositor_surface: Chrome stays behind the human's
+            # frontmost app. Screenshots work on background tabs in a windowed
+            # Chrome.
             try:
                 _attach_response_logger(page, network_log)
                 # Register before goto so a blocking modal ("Too many requests",
@@ -3148,8 +3140,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 # shorter than realistic uploads on a flaky link (observed
                 # ~60s on 442KB prompts). Gate explicitly with a wider hard
                 # ceiling so a stuck upload fails closed at a bounded deadline
-                # instead of masquerading as a 30s click timeout. Outside
-                # UiClipboardLock — sibling workers must stay free to paste.
+                # instead of masquerading as a 30s click timeout.
                 upload_wait_start = time.time()
                 try:
                     await page.wait_for_selector(SEND_BUTTON_READY, timeout=300_000, state="visible")
@@ -3195,11 +3186,10 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 # "Pro" and then re-resolve to the new conversation's default (a
                 # lower effort tier) during the paste/upload window, sending at
                 # the wrong effort while model_verified logged "Pro". This re-read
-                # is a passive inner_text() (no UiClipboardLock, no menu, no
-                # bring_to_front) so it can't hijack a sibling's paste. Fail
+                # is a passive inner_text() (no menu). Fail
                 # closed: never send at an effort we haven't verified. We do NOT
-                # re-run the chip menu here — that needs the clipboard lock and a
-                # fragile Radix dance with a loaded composer; surface the run_dir
+                # re-run the chip menu here — that is a fragile Radix dance with
+                # a loaded composer; surface the run_dir
                 # instead. Nothing slow runs between this read and the click. The
                 # model axis (invisible in the chip) is backstopped only by the
                 # served-slug audit after completion.
